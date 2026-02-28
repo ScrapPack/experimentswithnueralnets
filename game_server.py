@@ -10,6 +10,17 @@ World representation:
         +1.0 = solid ground
         −1.0 = air / empty
 
+Materials (Phase 8):
+    The grid is split into two materials with per-cell property maps:
+      Stone (left half, x < 5) — brittle and strong:
+        precision = 1.5 (amplifies stress → brittle shattering)
+        tensile   = 0.95 (passes stress easily → deep fractures)
+        threshold = −0.1 (holds until severely damaged)
+      Sand (right half, x ≥ 5) — malleable and weak:
+        precision = 0.5 (dampens stress → soft absorption)
+        tensile   = 0.4 (stress decays fast → localized crumbling)
+        threshold = 0.4 (crumbles very easily)
+
 Physics loop (on strike):
     1. Mark the cell as permanently destroyed (damage mask).
     2. Run hierarchical inference so the network "reacts" to the damage.
@@ -113,6 +124,43 @@ _GRAVITY_KERNEL = torch.tensor(
     device=device,
 ).view(1, 1, 3, 3)
 
+# ---------------------------------------------------------------------------
+# Material properties — heterogeneous 2D maps
+# ---------------------------------------------------------------------------
+#
+# precision_map : How much a cell amplifies stress on destruction
+#                 (brittleness).  High → sharp fracture; low → soft crumble.
+# tensile_map   : How efficiently a cell transfers stress to neighbours
+#                 during propagation (0 = absorbs all, 1 = passes all).
+# threshold_map : The value below which a cell auto-collapses.
+#
+
+precision_map = torch.ones(GRID_H, GRID_W, device=device)
+tensile_map   = torch.ones(GRID_H, GRID_W, device=device)
+threshold_map = torch.full((GRID_H, GRID_W), COLLAPSE_THRESHOLD, device=device)
+
+# Stone — left half (x < 5): brittle and strong.
+precision_map[:, :5] = 1.5
+tensile_map[:, :5]   = 0.95
+threshold_map[:, :5] = -0.1
+
+# Sand — right half (x ≥ 5): malleable and weak.
+precision_map[:, 5:] = 0.5
+tensile_map[:, 5:]   = 0.4
+threshold_map[:, 5:] = 0.4
+
+# Pre-shaped for element-wise use inside _propagate_stress.
+_tensile_map_2d = tensile_map.view(1, 1, GRID_H, GRID_W)
+
+# Flat material-label array returned by the API.
+_material_labels: list[str] = [
+    "stone" if x < 5 else "sand"
+    for y in range(GRID_H)
+    for x in range(GRID_W)
+]
+
+print(f"Materials: stone (x<5) | sand (x≥5)")
+
 
 # ---------------------------------------------------------------------------
 # Pre-training — physics prior
@@ -175,11 +223,16 @@ def _propagate_stress(
     ``max`` ensures that stress decays monotonically from the source
     (like a distance transform, not a diffusion).
 
-    Decay rate is governed by the kernel weights:
-        - 1 cell below:  0.30 × source stress
-        - 2 cells below: 0.30² = 0.09 × source
-        - 3 cells below: 0.30³ ≈ 0.03 × source
-        - 1 cell to side: 0.15 × source
+    Before the ``max``, each convolution result is element-wise
+    multiplied by ``_tensile_map_2d`` — the material's tensile
+    property.  Stone (0.95) passes stress almost undiminished
+    (deep fractures); sand (0.40) attenuates rapidly (local crumble).
+
+    Effective decay per hop (kernel weight × tensile):
+        Stone downward: 0.30 × 0.95 = 0.285
+        Sand  downward: 0.30 × 0.40 = 0.120
+        Stone lateral:  0.15 × 0.95 = 0.143
+        Sand  lateral:  0.15 × 0.40 = 0.060
 
     Args:
         state:  (1, 100) current world state.
@@ -195,7 +248,11 @@ def _propagate_stress(
     spread = stress.view(1, 1, GRID_H, GRID_W)
     for _ in range(PROPAGATION_PASSES):
         padded = F.pad(spread, [1, 1, 1, 1], mode="constant", value=0.0)
-        spread = torch.max(spread, F.conv2d(padded, _GRAVITY_KERNEL))
+        conv_result = F.conv2d(padded, _GRAVITY_KERNEL)
+        # Material dampening: tensile_map modulates how much stress
+        # each *receiving* cell accepts from its neighbours.
+        conv_result = conv_result * _tensile_map_2d
+        spread = torch.max(spread, conv_result)
 
     # Flatten and apply weakening (only weaken, never strengthen).
     weakening = spread.view(1, SENSORY_DIM) * STRESS_SCALE
@@ -218,9 +275,17 @@ def index():
 
 @app.route("/get_state", methods=["GET"])
 def get_state():
-    """Return the current world state as a flat JSON list of 100 floats."""
+    """Return the world state and static material labels.
+
+    Returns JSON::
+
+        {"state": [100 floats], "materials": [100 strings]}
+
+    ``materials`` is a flat list of ``"stone"`` or ``"sand"`` for each
+    cell (row-major).  Materials are static — they never change.
+    """
     state_list = current_world_state.squeeze(0).cpu().tolist()
-    return jsonify(state_list)
+    return jsonify({"state": state_list, "materials": _material_labels})
 
 
 @app.route("/strike", methods=["POST"])
@@ -261,16 +326,18 @@ def strike():
             current_world_state, steps=STRIKE_INFER_STEPS, eta_x=STRIKE_ETA_X,
         )
 
-        # 3. Stress = structural load released by the destroyed cell.
-        #    This is the value delta, NOT the network's prediction error.
-        #    A solid cell (+1 → −1) releases maximum load (2.0);
-        #    a pre-weakened cell (0.3 → −1) releases less (1.3).
-        #    Using |old − (−1)| = old + 1 ensures that even weakened
-        #    cells produce meaningful cascading stress.
-        stress_magnitude = abs(old_value + 1.0)
+        # 3. Stress = load released × material precision.
+        #    Habituation (load-based): |old − (−1)| = old + 1.
+        #    Precision modulates brittleness:
+        #      Stone (1.5) amplifies stress → sharp fractures.
+        #      Sand  (0.5) dampens stress  → soft crumble.
+        load_released = abs(old_value + 1.0)
+        stress_magnitude = load_released * precision_map[y, x].item()
+        mat_label = "stone" if x < 5 else "sand"
         print(
-            f"  Strike ({x},{y}) idx={idx}  "
-            f"old={old_value:.3f}  stress={stress_magnitude:.3f}",
+            f"  Strike ({x},{y}) idx={idx} [{mat_label}]  "
+            f"old={old_value:.3f}  load={load_released:.3f}  "
+            f"stress={stress_magnitude:.3f}",
             flush=True,
         )
 
@@ -293,7 +360,14 @@ def strike():
             newly_collapsed: list[tuple[int, float]] = []
             for i in range(SENSORY_DIM):
                 val = current_world_state[0, i].item()
-                if i not in destroyed_cells and val < COLLAPSE_THRESHOLD:
+                y_i = i // GRID_W
+                x_i = i % GRID_W
+                # Per-material threshold: stone (−0.1) holds longer;
+                # sand (0.4) crumbles at the first sign of weakness.
+                if (
+                    i not in destroyed_cells
+                    and val < threshold_map[y_i, x_i].item()
+                ):
                     newly_collapsed.append((i, val))
 
             if not newly_collapsed:
@@ -306,9 +380,14 @@ def strike():
             old_vals = {i: v for i, v in newly_collapsed}
             _force_destroyed(current_world_state)
 
-            # Propagate stress from each newly collapsed cell.
+            # Propagate stress from each newly collapsed cell,
+            # modulated by that cell's material precision.
             for i, old_v in newly_collapsed:
-                cascade_stress = abs(old_v + 1.0)
+                y_i = i // GRID_W
+                x_i = i % GRID_W
+                cascade_stress = (
+                    abs(old_v + 1.0) * precision_map[y_i, x_i].item()
+                )
                 stress = torch.zeros(1, SENSORY_DIM, device=device)
                 stress[0, i] = cascade_stress
                 current_world_state = _propagate_stress(

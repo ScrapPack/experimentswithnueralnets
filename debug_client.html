@@ -21,7 +21,7 @@
 </head>
 <body>
 <h1>Predictive Coding Gamestate Engine — Debug View</h1>
-<p class="info">Left-click to strike. Network prediction error drives structural stress; gravity kernel spreads damage downward.</p>
+<p class="info">Left-click to strike. Stone (left, dark) is brittle — deep fractures. Sand (right, gold) is weak — localized crumble.</p>
 <div id="grid"></div>
 <p class="info">
   Strikes: <span id="strikes">0</span> |
@@ -34,6 +34,7 @@
 <script>
 const W = 10, H = 10, URL = "http://127.0.0.1:5001";
 let strikes = 0, busy = false, destroyedSet = new Set();
+let materials = [];  // "stone" or "sand" per cell, fetched once
 
 const grid = document.getElementById("grid");
 const cells = [];
@@ -58,21 +59,22 @@ function updateGrid(state) {
   let weakened = 0;
   for (let i = 0; i < state.length && i < cells.length; i++) {
     const v = Math.max(-1, Math.min(1, state[i]));
-    // Color mapping:
-    //   +1.0 (solid)  → earthy brown  rgb(90, 65, 40)
-    //   ~0.5 (weak)   → cracked tan   rgb(180, 160, 120)
-    //    0.0 (failing) → pale sand     rgb(220, 210, 180)
-    //   -1.0 (air)    → sky blue      rgb(135, 200, 235)
     const t = (1.0 - v) / 2.0;  // 0=solid, 1=air
+    const mat = materials[i] || "stone";
     let r, g, b;
     if (t > 0.9) {
-      // Air/destroyed — sky blue
+      // Air/destroyed — sky blue (same for both materials)
       r = 135; g = 200; b = 235;
+    } else if (mat === "stone") {
+      // Stone: dark slate-gray → light gray-blue
+      r = Math.round(60 + t * 120);
+      g = Math.round(65 + t * 120);
+      b = Math.round(85 + t * 130);
     } else {
-      // Solid → cracked gradient
-      r = Math.round(90 + t * 140);
-      g = Math.round(65 + t * 155);
-      b = Math.round(40 + t * 150);
+      // Sand: warm golden-brown → pale tan
+      r = Math.round(190 + t * 40);
+      g = Math.round(160 + t * 60);
+      b = Math.round(80 + t * 100);
     }
     cells[i].style.background = `rgb(${r},${g},${b})`;
     cells[i].textContent = v.toFixed(2);
@@ -86,9 +88,12 @@ function updateGrid(state) {
 async function fetchState() {
   try {
     const r = await fetch(URL + "/get_state");
-    const state = await r.json();
-    updateGrid(state);
-    log("Initial state loaded — all cells solid");
+    const data = await r.json();
+    // /get_state returns {"state": [...], "materials": [...]}
+    materials = data.materials;
+    updateGrid(data.state);
+    const stoneCount = materials.filter(m => m === "stone").length;
+    log(`Initial state loaded — ${stoneCount} stone + ${100 - stoneCount} sand`);
   } catch(e) { log("ERROR: " + e.message); }
 }
 
