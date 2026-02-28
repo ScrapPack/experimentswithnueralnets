@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data (MNIST downloaded at runtime)
+data/
+
+# IDE / editor
+.claude/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
