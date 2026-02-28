@@ -6,10 +6,11 @@
 ## (destroy) it.  The Python server resolves the physics via free-energy
 ## minimization and returns the new world state.
 ##
-## Colour mapping:
-##     +1.0 (solid) → black
-##     −1.0 (air)   → white
-##     intermediate  → shades of grey
+## Colour mapping (earthy theme):
+##     +1.0 (solid)  → earthy brown  rgb(90, 65, 40)
+##     ~0.5 (weak)   → cracked tan   rgb(180, 160, 120)
+##      0.0 (failing) → pale sand     rgb(220, 210, 180)
+##     −1.0 (air)    → sky blue      rgb(135, 200, 235)
 
 extends Node2D
 
@@ -20,7 +21,7 @@ extends Node2D
 const GRID_W: int = 10
 const GRID_H: int = 10
 const BLOCK_SIZE: int = 40
-const SERVER_URL: String = "http://127.0.0.1:5000"
+const SERVER_URL: String = "http://127.0.0.1:5001"
 
 # ---------------------------------------------------------------------------
 # State
@@ -41,7 +42,7 @@ func _ready() -> void:
 			var block := ColorRect.new()
 			block.size = Vector2(38, 38)                         # 2 px gap
 			block.position = Vector2(x * BLOCK_SIZE + 1, y * BLOCK_SIZE + 1)
-			block.color = Color(0, 0, 0)                         # solid = black
+			block.color = Color(90.0/255, 65.0/255, 40.0/255)      # solid = earthy brown
 			add_child(block)
 			blocks.append(block)
 
@@ -122,9 +123,25 @@ func update_grid(state: Array) -> void:
 		if i >= blocks.size():
 			break
 
-		# Map value from [-1.0 … +1.0] to brightness [1.0 … 0.0]:
-		#   +1.0 (solid) → brightness 0.0 → black
-		#   -1.0 (air)   → brightness 1.0 → white
+		# Map value from [-1.0 … +1.0] to earthy colour gradient:
+		#   +1.0 (solid)  → earthy brown  rgb(90, 65, 40)
+		#   ~0.5 (weak)   → cracked tan   rgb(180, 160, 120)
+		#    0.0 (failing) → pale sand     rgb(220, 210, 180)
+		#   −1.0 (air)    → sky blue      rgb(135, 200, 235)
 		var value: float = clampf(float(state[i]), -1.0, 1.0)
-		var brightness: float = (1.0 - value) / 2.0
-		blocks[i].color = Color(brightness, brightness, brightness)
+		var t: float = (1.0 - value) / 2.0   # 0 = solid, 1 = air
+
+		var r: float
+		var g: float
+		var b: float
+
+		if t > 0.9:
+			# Air / destroyed — sky blue
+			r = 135.0; g = 200.0; b = 235.0
+		else:
+			# Solid → cracked gradient
+			r = 90.0 + t * 140.0
+			g = 65.0 + t * 155.0
+			b = 40.0 + t * 150.0
+
+		blocks[i].color = Color(r / 255.0, g / 255.0, b / 255.0)

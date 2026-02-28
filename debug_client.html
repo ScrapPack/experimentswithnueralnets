@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PC Gamestate — Debug Client</title>
+<style>
+  body { background: #1a1a2e; color: #eee; font-family: monospace; margin: 20px; }
+  h1 { color: #e94560; font-size: 18px; }
+  #grid { display: grid; grid-template-columns: repeat(10, 42px); gap: 2px; margin: 16px 0; }
+  .cell { width: 40px; height: 40px; border: 1px solid #333; cursor: pointer;
+          display: flex; align-items: center; justify-content: center;
+          font-size: 9px; transition: background 0.15s; }
+  .cell:hover { border-color: #e94560; }
+  #log { background: #0f0f23; padding: 10px; max-height: 250px; overflow-y: auto;
+         font-size: 11px; line-height: 1.5; border: 1px solid #333; margin-top: 12px; }
+  .info { color: #888; font-size: 12px; margin: 8px 0; }
+  button { background: #e94560; color: white; border: none; padding: 6px 16px;
+           cursor: pointer; font-family: monospace; margin-right: 8px; }
+  button:hover { background: #c73650; }
+</style>
+</head>
+<body>
+<h1>Predictive Coding Gamestate Engine — Debug View</h1>
+<p class="info">Left-click to strike. Network prediction error drives structural stress; gravity kernel spreads damage downward.</p>
+<div id="grid"></div>
+<p class="info">
+  Strikes: <span id="strikes">0</span> |
+  Destroyed: <span id="destroyed">0</span> |
+  Weakened (value &lt; 0.95): <span id="weakened">0</span>
+</p>
+<button onclick="resetGrid()">Reset</button>
+<div id="log"></div>
+
+<script>
+const W = 10, H = 10, URL = "http://127.0.0.1:5001";
+let strikes = 0, busy = false, destroyedSet = new Set();
+
+const grid = document.getElementById("grid");
+const cells = [];
+for (let y = 0; y < H; y++) {
+  for (let x = 0; x < W; x++) {
+    const cell = document.createElement("div");
+    cell.className = "cell";
+    cell.style.background = "#2a6e2a";
+    cell.onclick = () => doStrike(x, y);
+    grid.appendChild(cell);
+    cells.push(cell);
+  }
+}
+
+function log(msg) {
+  const el = document.getElementById("log");
+  el.innerHTML += msg + "<br>";
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateGrid(state) {
+  let weakened = 0;
+  for (let i = 0; i < state.length && i < cells.length; i++) {
+    const v = Math.max(-1, Math.min(1, state[i]));
+    // Color mapping:
+    //   +1.0 (solid)  → earthy brown  rgb(90, 65, 40)
+    //   ~0.5 (weak)   → cracked tan   rgb(180, 160, 120)
+    //    0.0 (failing) → pale sand     rgb(220, 210, 180)
+    //   -1.0 (air)    → sky blue      rgb(135, 200, 235)
+    const t = (1.0 - v) / 2.0;  // 0=solid, 1=air
+    let r, g, b;
+    if (t > 0.9) {
+      // Air/destroyed — sky blue
+      r = 135; g = 200; b = 235;
+    } else {
+      // Solid → cracked gradient
+      r = Math.round(90 + t * 140);
+      g = Math.round(65 + t * 155);
+      b = Math.round(40 + t * 150);
+    }
+    cells[i].style.background = `rgb(${r},${g},${b})`;
+    cells[i].textContent = v.toFixed(2);
+    cells[i].style.color = t > 0.5 ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.5)";
+    if (v < 0.95) weakened++;
+  }
+  document.getElementById("weakened").textContent = weakened;
+  document.getElementById("destroyed").textContent = destroyedSet.size;
+}
+
+async function fetchState() {
+  try {
+    const r = await fetch(URL + "/get_state");
+    const state = await r.json();
+    updateGrid(state);
+    log("Initial state loaded — all cells solid");
+  } catch(e) { log("ERROR: " + e.message); }
+}
+
+async function doStrike(x, y) {
+  if (busy) return;
+  busy = true;
+  const idx = y * W + x;
+  destroyedSet.add(idx);
+  log(`Strike (${x}, ${y}) ...`);
+  try {
+    const r = await fetch(URL + "/strike", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({x, y})
+    });
+    const state = await r.json();
+    strikes++;
+    document.getElementById("strikes").textContent = strikes;
+    updateGrid(state);
+    log(`  → cell[${x},${y}]=${state[idx].toFixed(3)}  min=${Math.min(...state).toFixed(3)}  max=${Math.max(...state).toFixed(3)}`);
+  } catch(e) { log("ERROR: " + e.message); }
+  busy = false;
+}
+
+async function resetGrid() {
+  try {
+    const r = await fetch(URL + "/reset", {method: "POST"});
+    const state = await r.json();
+    strikes = 0;
+    destroyedSet.clear();
+    document.getElementById("strikes").textContent = 0;
+    updateGrid(state);
+    log("--- RESET ---");
+  } catch(e) { log("ERROR: " + e.message); }
+}
+
+fetchState();
+</script>
+</body>
+</html>
