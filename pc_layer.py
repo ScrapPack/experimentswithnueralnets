@@ -1,28 +1,27 @@
 """
-Predictive Coding Layer — Phases 1, 3, 5a & 5b
+Cortical Column — Phase 1: The Sensorimotor Column
 
-A stateful, locally autonomous layer for a predictive coding network.
-This is an energy-based model component that maintains its own internal
-dynamics (beliefs and prediction errors) and updates via local Hebbian
-rules. No autograd. No global clock. No backpropagation.
+A biologically-structured cortical column implementing the Thousand Brains
+theory.  Replaces the monolithic PCLayer with a CorticalColumn that natively
+separates object identity ("What" / L2/3), sensor location ("Where" / L6),
+and motor output ("Action" / L5).
 
-Mathematical foundation:
-    - Top-down prediction:  p_td = activation(x_above) @ W^T + b
-    - Lateral prediction:   p_lat = activation(x) @ L^T
-    - Local error:          e = x - p_td - p_lat
-    - Precision:            pi = exp(-log_var)   (per-dimension)
-    - Precision-weighted error:  pe = e * pi
-    - The derivative of the activation function is computed analytically
-      (not via autograd) to support bottom-up and lateral pressure.
-    - Hebbian weight update (slow dynamics):
-          dW = pe_below^T @ activation(x) / B
-          db = pe_below.sum(dim=0) / B
-    - Lateral Hebbian update (slow dynamics):
-          dL = pe_i^T @ activation(x) / B
-          L += eta_l * dL;  diag(L) := 0
-    - Variance update (slow dynamics):
-          d_log_var = 0.5 * (1 - (e^2 * pi).mean(dim=0))
-          log_var -= eta_v * d_log_var
+Mathematical foundation (Free Energy Principle):
+    - L2/3 generative prediction (composite):
+          prediction = activation(W_obj @ x_obj + W_loc @ x_loc)
+    - L4 sensory error:
+          error = sensory_input - prediction
+    - Internal ODE settling (dual state):
+          dx_obj = W_obj.T @ error
+          dx_loc = W_loc.T @ error
+    - L5 motor action (Active Inference):
+          action = eta_a * (sensory_gradient.T @ error)
+    - Hebbian learning:
+          dW_obj = eta_w * (error @ x_obj.T)
+          dW_loc = eta_w * (error @ x_loc.T)
+
+No autograd. No backpropagation. All dynamics are local ODEs
+minimising Free Energy (prediction error).
 
 Hardware: defaults to MPS (Apple Silicon) when available.
 """
@@ -74,7 +73,7 @@ def _relu_pair() -> tuple[Callable[[Tensor], Tensor], Callable[[Tensor], Tensor]
 
 
 def _sigmoid_pair() -> tuple[Callable[[Tensor], Tensor], Callable[[Tensor], Tensor]]:
-    """Return (sigmoid, d_sigmoid/dx) where the derivative is sig(x)(1 - sig(x))."""
+    """Return (sigmoid, d_sigmoid/dx) where the derivative is sig(x)(1-sig(x))."""
     def fwd(x: Tensor) -> Tensor:
         return torch.sigmoid(x)
 
@@ -93,52 +92,49 @@ _ACTIVATION_REGISTRY: dict[str, Callable[[], tuple[Callable, Callable]]] = {
 
 
 # ---------------------------------------------------------------------------
-# PCLayer
+# CorticalColumn
 # ---------------------------------------------------------------------------
 
-class PCLayer(nn.Module):
-    """A single Predictive Coding layer with lateral connections.
+class CorticalColumn(nn.Module):
+    """A single Cortical Column with separated What/Where/Action streams.
 
-    This layer is a *generative* unit: it holds top-down weights that
-    predict the activity of the layer below, and **lateral weights**
-    that let neurons within the same layer predict each other.  It
-    maintains its own mutable state tensors (belief ``x`` and error
-    ``e``) which evolve during the iterative settling phase.
+    Implements the Thousand Brains theory at the single-column level.
+    Internally maintains two latent state vectors and two generative
+    weight matrices that jointly predict sensory input:
 
-    Parameters (slow dynamics, updated by Hebbian rules — not by autograd):
-        weight         : (output_dim, input_dim) — generative weights, top-down.
-        bias           : (output_dim,)           — generative bias.
-        log_var        : (input_dim,)            — log-variance of beliefs.
-        lateral_weight : (input_dim, input_dim)  — lateral (horizontal)
-                         weights.  Diagonal is always zero to prevent
-                         self-excitation.
+    States (fast dynamics — settle each observation):
+        x_obj : (batch, obj_dim)  — L2/3 "What" belief (object identity).
+        x_loc : (batch, loc_dim)  — L6 "Where" belief (sensor location).
+        error : (batch, sensory_dim) — L4 prediction error.
 
-    States (fast dynamics, reset each observation):
-        x : (batch, input_dim)  — current belief / neural activity.
-        e : (batch, input_dim)  — local prediction error (same shape as x).
+    Parameters (slow dynamics — Hebbian learning):
+        W_obj : (sensory_dim, obj_dim) — generative weights for object.
+        W_loc : (sensory_dim, loc_dim) — generative weights for location.
 
-    The convention ``input_dim -> output_dim`` follows the *generative*
-    (top-down) direction: ``input_dim`` is the dimensionality of *this*
-    layer's beliefs, and ``output_dim`` is the dimensionality of the
-    layer below that we are predicting.
+    The composite generative prediction sent from L2/3 down to L4:
+        prediction = activation(W_obj @ x_obj + W_loc @ x_loc)
+
+    L5 motor output computes Active Inference action commands from
+    the spatial gradient of sensory input and the L4 error.
 
     Args:
-        input_dim:  Dimensionality of this layer's activity (x).
-        output_dim: Dimensionality of the layer below (prediction target).
-        activation_fn_name: One of ``'tanh'``, ``'relu'``, ``'sigmoid'``.
+        obj_dim:     Dimensionality of the "What" state (L2/3).
+        loc_dim:     Dimensionality of the "Where" state (L6).
+        sensory_dim: Dimensionality of the sensory input (L4 target).
+        activation_fn_name: One of 'tanh', 'relu', 'sigmoid'.
     """
 
-    weight: Tensor
-    bias: Tensor
-    log_var: Tensor
-    lateral_weight: Tensor
-    x: Optional[Tensor]
-    e: Optional[Tensor]
+    W_obj: Tensor
+    W_loc: Tensor
+    x_obj: Optional[Tensor]
+    x_loc: Optional[Tensor]
+    error: Optional[Tensor]
 
     def __init__(
         self,
-        input_dim: int,
-        output_dim: int,
+        obj_dim: int,
+        loc_dim: int,
+        sensory_dim: int,
         activation_fn_name: str = "tanh",
     ) -> None:
         super().__init__()
@@ -149,8 +145,9 @@ class PCLayer(nn.Module):
                 f"Choose from {list(_ACTIVATION_REGISTRY.keys())}."
             )
 
-        self.input_dim = input_dim
-        self.output_dim = output_dim
+        self.obj_dim = obj_dim
+        self.loc_dim = loc_dim
+        self.sensory_dim = sensory_dim
         self.activation_fn_name = activation_fn_name
 
         # Activation function and its analytical derivative.
@@ -159,244 +156,222 @@ class PCLayer(nn.Module):
         ]()
 
         # --- Slow parameters (no autograd) ---
-        # Weight shape: (output_dim, input_dim) — maps from this layer's
-        # activated state down to the layer below.
-        weight = torch.empty(output_dim, input_dim)
-        nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
-        self.weight = nn.Parameter(weight, requires_grad=False)
+        # W_obj: (sensory_dim, obj_dim) — "What" generative weights.
+        w_obj = torch.empty(sensory_dim, obj_dim)
+        nn.init.kaiming_uniform_(w_obj, a=math.sqrt(5))
+        self.W_obj = nn.Parameter(w_obj, requires_grad=False)
 
-        # Bias initialised following the same fan-in convention as nn.Linear.
-        fan_in = input_dim
-        bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
-        bias = torch.empty(output_dim).uniform_(-bound, bound)
-        self.bias = nn.Parameter(bias, requires_grad=False)
+        # W_loc: (sensory_dim, loc_dim) — "Where" generative weights.
+        w_loc = torch.empty(sensory_dim, loc_dim)
+        nn.init.kaiming_uniform_(w_loc, a=math.sqrt(5))
+        self.W_loc = nn.Parameter(w_loc, requires_grad=False)
 
-        # Log-variance of this layer's beliefs.  Initialised to 0 so that
-        # precision = exp(-0) = 1  (uniform confidence everywhere).
-        self.log_var = nn.Parameter(
-            torch.zeros(input_dim), requires_grad=False
-        )
-
-        # Lateral (horizontal) weight matrix — neurons predicting their
-        # peers within the same layer.  Small random init; diagonal is
-        # zeroed to prevent self-excitation.
-        lateral = torch.empty(input_dim, input_dim)
-        nn.init.normal_(lateral, mean=0.0, std=0.01)
-        lateral.fill_diagonal_(0)
-        self.lateral_weight = nn.Parameter(lateral, requires_grad=False)
-
-        # --- Fast states (initialised lazily per-batch) ---
-        self.x = None
-        self.e = None
+        # --- Fast states (initialised lazily per observation) ---
+        self.x_obj = None
+        self.x_loc = None
+        self.error = None
 
     # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
 
-    def reset_states(self, batch_size: int, device: Optional[torch.device] = None) -> None:
-        """Zero-initialise the belief and error states for a new observation.
-
-        Call this once before each settling phase begins.
+    def reset_states(
+        self, batch_size: int, device: Optional[torch.device] = None,
+    ) -> None:
+        """Zero-initialise all fast states for a new observation.
 
         Args:
             batch_size: Number of samples in the current batch.
-            device:     Target device. If ``None``, uses the device of
-                        ``self.weight``.
+            device:     Target device (defaults to W_obj's device).
         """
         if device is None:
-            device = self.weight.device
+            device = self.W_obj.device
 
-        self.x = torch.zeros(batch_size, self.input_dim, device=device)
-        self.e = torch.zeros(batch_size, self.input_dim, device=device)
+        self.x_obj = torch.zeros(batch_size, self.obj_dim, device=device)
+        self.x_loc = torch.zeros(batch_size, self.loc_dim, device=device)
+        self.error = torch.zeros(batch_size, self.sensory_dim, device=device)
 
     # ------------------------------------------------------------------
-    # Precision (attention / neuromodulation)
+    # L2/3 → L4: Generative prediction
     # ------------------------------------------------------------------
 
-    def get_precision(self) -> Tensor:
-        """Return the per-dimension precision vector.
+    def predict_down(self) -> Tensor:
+        """Compute the composite L2/3 generative prediction for L4.
 
         .. math::
-            \\pi = \\exp(-\\text{log\\_var})
-
-        High precision (low variance) means the layer is *confident* in
-        that dimension — its prediction errors will exert more force on
-        both inference and learning.
+            p = \\text{activation}(W_{obj} \\cdot x_{obj} + W_{loc} \\cdot x_{loc})
 
         Returns:
-            precision: (input_dim,)
+            prediction: (batch, sensory_dim)
         """
-        return torch.exp(-self.log_var)
+        # x_obj: (B, obj_dim), W_obj: (sensory_dim, obj_dim)
+        # x_loc: (B, loc_dim), W_loc: (sensory_dim, loc_dim)
+        composite = (
+            self.x_obj @ self.W_obj.t()    # (B, sensory_dim)
+            + self.x_loc @ self.W_loc.t()  # (B, sensory_dim)
+        )
+        return self.activation_fn(composite)
 
     # ------------------------------------------------------------------
-    # Core computations
+    # L4: Sensory error
     # ------------------------------------------------------------------
 
-    def predict_down(self, x_above: Tensor) -> Tensor:
-        """Compute the top-down prediction for the layer below.
+    def compute_error(self, sensory_input: Tensor) -> Tensor:
+        """Compute and store the L4 prediction error.
 
         .. math::
-            p = \\text{activation}(x_{above}) \\; W^T + b
-
-        ``x_above`` is the raw (pre-activation) belief state of the layer
-        above this one.  We apply the activation here so that the
-        non-linearity lives in the generative model, not in the state
-        update rule.
+            \\epsilon = \\text{sensory\\_input} - \\text{prediction}
 
         Args:
-            x_above: (batch, input_dim) — beliefs of the layer above.
+            sensory_input: (batch, sensory_dim) — observed data.
 
         Returns:
-            prediction: (batch, output_dim) — predicted activity for the
-            layer below.
+            error: (batch, sensory_dim)
         """
-        activated = self.activation_fn(x_above)                 # (B, input_dim)
-        prediction = activated @ self.weight.t() + self.bias    # (B, output_dim)
-        return prediction
+        prediction = self.predict_down()
+        self.error = sensory_input - prediction
+        return self.error
 
-    def compute_error(self, prediction_from_above: Tensor) -> Tensor:
-        """Compute and store the local prediction error.
+    # ------------------------------------------------------------------
+    # Internal ODE settling
+    # ------------------------------------------------------------------
 
-        The error now accounts for both the top-down prediction from the
-        layer above *and* the lateral prediction from peer neurons:
+    def infer_step(
+        self,
+        sensory_input: Tensor,
+        eta_x: float,
+        freeze_obj: bool = False,
+    ) -> None:
+        """One Euler step of the dual-state settling ODE.
+
+        Both x_obj and x_loc evolve simultaneously to minimise the L4
+        prediction error.  The gradient flows through the activation
+        derivative to respect the nonlinearity.
 
         .. math::
-            p_{\\text{lat}} = f(x) \\; L^T
+            dx_{obj} = W_{obj}^T \\cdot \\text{error\\_grad}
+            dx_{loc} = W_{loc}^T \\cdot \\text{error\\_grad}
 
-            \\epsilon = x - p_{\\text{above}} - p_{\\text{lat}}
+        where error_grad = error * activation'(composite) accounts for
+        the chain rule through the activation function.
+
+        When ``freeze_obj=True``, only x_loc updates.  This is used
+        during sensorimotor tracking: L2/3 object identity is stable
+        across saccades while L6 location adapts to each new view.
 
         Args:
-            prediction_from_above: (batch, input_dim) — the top-down
-                prediction targeting this layer's activity.
+            sensory_input: (batch, sensory_dim) — observed data.
+            eta_x: Step size for belief updates.
+            freeze_obj: If True, hold x_obj fixed (only x_loc settles).
+        """
+        # Recompute composite pre-activation and prediction.
+        composite = (
+            self.x_obj @ self.W_obj.t()
+            + self.x_loc @ self.W_loc.t()
+        )
+        prediction = self.activation_fn(composite)
+        self.error = sensory_input - prediction
+
+        # Chain rule: error gradient through activation derivative.
+        deriv = self.activation_deriv(composite)  # (B, sensory_dim)
+        error_grad = self.error * deriv           # (B, sensory_dim)
+
+        # Dual-state update: both states chase the same error signal.
+        if not freeze_obj:
+            dx_obj = error_grad @ self.W_obj   # (B, obj_dim)
+            self.x_obj = self.x_obj + eta_x * dx_obj
+
+        dx_loc = error_grad @ self.W_loc   # (B, loc_dim)
+        self.x_loc = self.x_loc + eta_x * dx_loc
+
+    # ------------------------------------------------------------------
+    # L5: Motor action (Active Inference)
+    # ------------------------------------------------------------------
+
+    def get_motor_action(
+        self,
+        sensory_gradient: Tensor,
+        eta_a: float = 0.01,
+    ) -> Tensor:
+        """Compute Active Inference motor commands from L5.
+
+        The motor system acts on the *world* to reduce prediction error
+        by moving the sensor.  The action is the gradient of free energy
+        w.r.t. the sensory input, projected through the spatial gradient
+        of the sensor.
+
+        .. math::
+            a = \\eta_a \\cdot (\\nabla_{\\text{spatial}} s)^T \\cdot \\epsilon
+
+        Args:
+            sensory_gradient: (batch, sensory_dim, action_dim) — spatial
+                gradient of the sensory input w.r.t. motor coordinates
+                (e.g., [dx, dy] shift of the fovea).
+            eta_a: Motor learning rate / gain.
 
         Returns:
-            error: (batch, input_dim) — the freshly computed error, also
-            stored in ``self.e``.
-
-        Raises:
-            RuntimeError: If ``reset_states`` has not been called yet.
+            action: (batch, action_dim) — motor velocity commands.
         """
-        if self.x is None:
+        if self.error is None:
             raise RuntimeError(
-                "States not initialised. Call reset_states() before compute_error()."
+                "No error computed. Call infer_step() before get_motor_action()."
             )
 
-        # Lateral prediction: peers predicting each other.
-        p_lat = self.activation_fn(self.x) @ self.lateral_weight.t()
-
-        self.e = self.x - prediction_from_above - p_lat
-        return self.e
+        # Active Inference: minimise free energy by acting on the world.
+        #   dF/da = error * ds/da   (chain rule through sensory input)
+        #   action = -dF/da         (gradient DESCENT on free energy)
+        #
+        # error: (B, sensory_dim)
+        # sensory_gradient: (B, sensory_dim, action_dim)
+        # result: (B, action_dim)
+        action = -eta_a * torch.einsum("bs,bsa->ba", self.error, sensory_gradient)
+        return action
 
     # ------------------------------------------------------------------
-    # Learning (slow dynamics)
+    # Learning (slow dynamics — Hebbian)
     # ------------------------------------------------------------------
 
-    def update_weights(
-        self,
-        pe_below: Tensor,
-        pe_i: Tensor,
-        eta_w: float,
-        eta_l: float = 0.001,
-    ) -> None:
-        """Hebbian update for top-down weights, bias, and lateral weights.
+    def learn(self, eta_w: float = 0.001) -> None:
+        """Hebbian update for both generative weight matrices.
 
         Called *after* the inference loop has settled.
 
-        **Top-down weights & bias** — driven by the precision-weighted
-        error at the layer below:
-
         .. math::
-            \\Delta W = \\frac{1}{B} \\; \\tilde{\\epsilon}_{\\text{below}}^{\\top} \\; f(x)
+            \\Delta W_{obj} = \\eta_w \\cdot \\epsilon^T \\cdot x_{obj}
+            \\Delta W_{loc} = \\eta_w \\cdot \\epsilon^T \\cdot x_{loc}
 
-            \\Delta b = \\frac{1}{B} \\; \\sum_{\\text{batch}} \\tilde{\\epsilon}_{\\text{below}}
-
-        **Lateral weights** — driven by this layer's own precision-weighted
-        error:
-
-        .. math::
-            \\Delta L = \\frac{1}{B} \\; \\tilde{\\epsilon}_i^{\\top} \\; f(x)
-
-        followed by zeroing the diagonal to prevent self-excitation.
+        Averaged over the batch.
 
         Args:
-            pe_below: (batch, output_dim) — precision-weighted error at
-                      the layer this PCLayer predicts (one level down).
-            pe_i:     (batch, input_dim) — this layer's own precision-
-                      weighted error.
-            eta_w:    Learning rate for top-down weight / bias updates.
-            eta_l:    Learning rate for lateral weight updates.
-
-        Raises:
-            RuntimeError: If states have not been initialised.
+            eta_w: Learning rate for weight updates.
         """
-        if self.x is None:
+        if self.error is None or self.x_obj is None:
             raise RuntimeError(
-                "States not initialised.  Run infer() before update_weights()."
+                "States not initialised. Run inference before learn()."
             )
 
-        batch_size = pe_below.shape[0]
+        batch_size = self.error.shape[0]
 
-        # activated: (B, input_dim)
-        activated = self.activation_fn(self.x)
+        # dW_obj: (sensory_dim, B) @ (B, obj_dim) -> (sensory_dim, obj_dim)
+        dW_obj = (self.error.t() @ self.x_obj) / batch_size
+        dW_loc = (self.error.t() @ self.x_loc) / batch_size
 
-        # --- Top-down weight update ---
-        # dW: (output_dim, B) @ (B, input_dim) -> (output_dim, input_dim)
-        dW = (pe_below.t() @ activated) / batch_size
-        db = pe_below.sum(dim=0) / batch_size
+        self.W_obj.data += eta_w * dW_obj
+        self.W_loc.data += eta_w * dW_loc
 
-        self.weight.data += eta_w * dW
-        self.bias.data += eta_w * db
+    # ------------------------------------------------------------------
+    # Energy
+    # ------------------------------------------------------------------
 
-        # --- Lateral weight update ---
-        # dL: (input_dim, B) @ (B, input_dim) -> (input_dim, input_dim)
-        dL = (pe_i.t() @ activated) / batch_size
-
-        self.lateral_weight.data += eta_l * dL
-        # CRITICAL: re-zero diagonal to prevent self-excitation.
-        self.lateral_weight.data.fill_diagonal_(0)
-
-    def update_variance(self, eta_v: float) -> None:
-        """Update the log-variance via gradient descent on free energy.
-
-        The free-energy contribution from this layer under a Gaussian
-        generative model is:
+    def get_energy(self) -> float:
+        """Return the current free energy (sum of squared prediction error).
 
         .. math::
-            F_i = \\frac{1}{2} \\sum_j \\left[ \\epsilon_j^2 \\, \\pi_j
-                  + \\log \\sigma_j^2 \\right]
-
-        Taking the derivative w.r.t. ``log_var_j``:
-
-        .. math::
-            \\frac{\\partial F_i}{\\partial \\text{log\\_var}_j}
-                = \\frac{1}{2} \\left(1 - \\epsilon_j^2 \\, \\pi_j \\right)
-
-        averaged over the batch.  The update is gradient descent:
-
-        .. math::
-            \\text{log\\_var} \\;-\\!=\\; \\eta_v \\cdot d\\text{log\\_var}
-
-        **Intuition**: If squared errors are large relative to precision,
-        the gradient is negative, so ``log_var`` *increases* (variance up,
-        precision down) — the layer becomes less confident.  If errors
-        are small, ``log_var`` *decreases* (precision up) — the layer
-        becomes more confident.
-
-        Args:
-            eta_v: Learning rate for variance updates.
-
-        Raises:
-            RuntimeError: If states have not been initialised.
+            F = \\frac{1}{2} \\sum \\epsilon^2
         """
-        if self.e is None:
-            raise RuntimeError(
-                "States not initialised.  Run infer() before update_variance()."
-            )
-
-        pi = self.get_precision()                                # (input_dim,)
-        # d_log_var: (input_dim,) — mean over batch
-        d_log_var = 0.5 * (1.0 - (self.e ** 2 * pi).mean(dim=0))
-        self.log_var.data -= eta_v * d_log_var
+        if self.error is None:
+            return 0.0
+        return 0.5 * (self.error * self.error).sum().item()
 
     # ------------------------------------------------------------------
     # Utilities
@@ -404,137 +379,60 @@ class PCLayer(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"input_dim={self.input_dim}, output_dim={self.output_dim}, "
-            f"activation={self.activation_fn_name}"
+            f"obj_dim={self.obj_dim}, loc_dim={self.loc_dim}, "
+            f"sensory_dim={self.sensory_dim}, activation={self.activation_fn_name}"
         )
 
 
 # ---------------------------------------------------------------------------
-# Quick smoke test — verifies shapes, device placement, precision,
-# lateral connections, and no autograd.
+# Smoke test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     device = _get_device()
     print(f"Using device: {device}\n")
 
-    # -----------------------------------------------------------------
-    # Build a two-layer hierarchy to exercise all methods properly.
-    #
-    #   Layer 2 (top):  dim=16  --predict_down-->  Layer 1:  dim=64
-    #   Layer 1:        dim=64  --predict_down-->  Layer 0 (sensory): dim=32
-    #
-    # layer_2: input_dim=16, output_dim=64  (predicts layer 1)
-    # layer_1: input_dim=64, output_dim=32  (predicts layer 0 / sensory)
-    # -----------------------------------------------------------------
+    col = CorticalColumn(
+        obj_dim=8, loc_dim=4, sensory_dim=25, activation_fn_name="tanh",
+    ).to(device)
+    print(col)
 
-    batch_size = 8
+    B = 1
+    col.reset_states(B, device)
+    print(f"\n  x_obj shape: {col.x_obj.shape}  (expect [1, 8])")
+    print(f"  x_loc shape: {col.x_loc.shape}  (expect [1, 4])")
 
-    layer_2 = PCLayer(input_dim=16, output_dim=64, activation_fn_name="tanh").to(device)
-    layer_1 = PCLayer(input_dim=64, output_dim=32, activation_fn_name="tanh").to(device)
+    # Fake sensory input.
+    sensory = torch.randn(B, 25, device=device)
 
-    print("--- Layer 2 (top) ---")
-    print(layer_2)
-    print(f"  weight         shape : {layer_2.weight.shape}")
-    print(f"  bias           shape : {layer_2.bias.shape}")
-    print(f"  log_var        shape : {layer_2.log_var.shape}")
-    print(f"  lateral_weight shape : {layer_2.lateral_weight.shape}")
+    # Settle for 20 steps.
+    energies = []
+    for step in range(20):
+        col.infer_step(sensory, eta_x=0.1)
+        energies.append(col.get_energy())
 
-    print("\n--- Layer 1 ---")
-    print(layer_1)
-    print(f"  weight         shape : {layer_1.weight.shape}")
-    print(f"  bias           shape : {layer_1.bias.shape}")
-    print(f"  log_var        shape : {layer_1.log_var.shape}")
-    print(f"  lateral_weight shape : {layer_1.lateral_weight.shape}")
+    print(f"\n  Energy step  0: {energies[0]:.4f}")
+    print(f"  Energy step 19: {energies[-1]:.4f}")
+    assert energies[-1] < energies[0], "Energy did not decrease!"
+    print("  Energy decreased  [OK]")
 
-    # Verify lateral diagonal is zero at init.
-    diag_2 = layer_2.lateral_weight.data.diag()
-    assert diag_2.abs().max().item() == 0.0, "Lateral diagonal not zero at init!"
-    print(f"\n  layer_2 lateral diag max: {diag_2.abs().max().item()}  (zero)  [OK]")
-    lat_mean_2 = layer_2.lateral_weight.data.abs().mean().item()
-    print(f"  layer_2 lateral |mean|: {lat_mean_2:.6f}")
+    # Motor action test.
+    grad = torch.randn(B, 25, 2, device=device)
+    action = col.get_motor_action(grad, eta_a=0.01)
+    print(f"\n  Motor action shape: {action.shape}  (expect [1, 2])")
+    assert action.shape == (B, 2)
+    print("  Motor action computed  [OK]")
 
-    # Verify precision at init (log_var=0 -> precision=1).
-    prec_2 = layer_2.get_precision()
-    assert prec_2.shape == (16,)
-    assert torch.allclose(prec_2, torch.ones(16, device=device)), "Initial precision should be 1.0!"
-    print(f"  layer_2 precision at init: {prec_2[:4].tolist()} ...  (all 1.0)  [OK]")
+    # Learning test.
+    w_obj_before = col.W_obj.data.clone()
+    col.learn(eta_w=0.01)
+    w_delta = (col.W_obj.data - w_obj_before).abs().sum().item()
+    assert w_delta > 0, "Weights did not change!"
+    print(f"  W_obj delta after learn: {w_delta:.6f}  [OK]")
 
-    # Reset states for a new observation.
-    layer_2.reset_states(batch_size, device)
-    layer_1.reset_states(batch_size, device)
-    print(f"\n  layer_2.x shape : {layer_2.x.shape}")
-    print(f"  layer_1.x shape : {layer_1.x.shape}")
+    # No autograd.
+    for name, param in col.named_parameters():
+        assert not param.requires_grad, f"{name} has requires_grad=True!"
+    print("  All parameters requires_grad=False  [OK]")
 
-    # Layer 2 predicts down to layer 1.
-    prediction_for_1 = layer_2.predict_down(layer_2.x)
-    print(f"\n  layer_2.predict_down -> {prediction_for_1.shape}  (should be [8, 64])")
-    assert prediction_for_1.shape == (batch_size, 64)
-
-    # Layer 1 computes its error with lateral prediction included.
-    error_1 = layer_1.compute_error(prediction_for_1)
-    print(f"  layer_1.compute_error -> {error_1.shape}  (should be [8, 64])")
-    assert error_1.shape == (batch_size, 64)
-
-    # Layer 1 predicts down to sensory layer (dim=32).
-    prediction_for_0 = layer_1.predict_down(layer_1.x)
-    print(f"  layer_1.predict_down -> {prediction_for_0.shape}  (should be [8, 32])")
-    assert prediction_for_0.shape == (batch_size, 32)
-
-    # Verify analytical derivatives for each activation type.
-    print("\n--- Analytical derivatives ---")
-    for act_name in _ACTIVATION_REGISTRY:
-        test_layer = PCLayer(16, 8, activation_fn_name=act_name).to(device)
-        test_input = torch.randn(4, 16, device=device)
-        d = test_layer.activation_deriv(test_input)
-        print(f"  {act_name:>8s}  deriv shape={d.shape}  "
-              f"range=[{d.min().item():.4f}, {d.max().item():.4f}]")
-
-    # --- Precision & variance update test ---
-    print("\n--- Precision / variance update ---")
-    layer_1.e = torch.randn(batch_size, 64, device=device) * 0.5
-    lv_before = layer_1.log_var.data.clone()
-    layer_1.update_variance(eta_v=0.01)
-    lv_delta = (layer_1.log_var.data - lv_before).abs().sum().item()
-    assert lv_delta > 0, "log_var did not change after update_variance!"
-    print(f"  log_var delta after update_variance: {lv_delta:.6f}  [OK]")
-
-    # --- Lateral update test ---
-    print("\n--- Lateral weight update ---")
-    layer_1.x = torch.randn(batch_size, 64, device=device)
-    layer_1.e = torch.randn(batch_size, 64, device=device) * 0.3
-    lat_before = layer_1.lateral_weight.data.clone()
-    lat_mean_before = lat_before.abs().mean().item()
-
-    # Fake pe_below and pe_i for testing.
-    fake_pe_below = torch.randn(batch_size, 32, device=device) * 0.1
-    fake_pe_i = layer_1.e * layer_1.get_precision()
-
-    layer_1.update_weights(fake_pe_below, fake_pe_i, eta_w=0.001, eta_l=0.01)
-
-    lat_after = layer_1.lateral_weight.data
-    lat_mean_after = lat_after.abs().mean().item()
-    lat_delta = (lat_after - lat_before).abs().sum().item()
-    assert lat_delta > 0, "Lateral weights did not change!"
-    print(f"  lateral |mean| before: {lat_mean_before:.6f}")
-    print(f"  lateral |mean| after : {lat_mean_after:.6f}")
-    print(f"  lateral total delta  : {lat_delta:.6f}  [OK]")
-
-    # Verify diagonal is still zero after update.
-    diag_after = lat_after.diag()
-    assert diag_after.abs().max().item() == 0.0, "Lateral diagonal not zero after update!"
-    print(f"  lateral diag max after update: {diag_after.abs().max().item()}  (zero)  [OK]")
-
-    # Confirm no gradients anywhere.
-    for layer_name, layer in [("layer_2", layer_2), ("layer_1", layer_1)]:
-        for name, param in layer.named_parameters():
-            assert not param.requires_grad, f"{layer_name}.{name} has requires_grad=True!"
-    print("\n  All parameters have requires_grad=False  [OK]")
-
-    # Verify reset clears state.
-    layer_1.x.fill_(99.0)
-    layer_1.reset_states(batch_size, device)
-    assert layer_1.x.abs().max().item() == 0.0, "reset_states did not zero x!"
-    print("  reset_states zeros out state  [OK]")
-
-    print("\nPhase 5b layer smoke test passed.")
+    print("\nCorticalColumn smoke test passed.")
