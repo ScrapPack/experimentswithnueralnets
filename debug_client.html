@@ -21,20 +21,23 @@
 </head>
 <body>
 <h1>Predictive Coding Gamestate Engine — Debug View</h1>
-<p class="info">Left-click to strike. Stone (left, dark) is brittle — deep fractures. Sand (right, gold) is weak — localized crumble.</p>
+<p class="info">Left-click = strike (density). Right-click = heat (thermal). Stone (left, dark) is brittle. Sand (right, gold) is weak.</p>
 <div id="grid"></div>
 <p class="info">
   Strikes: <span id="strikes">0</span> |
+  Heats: <span id="heats">0</span> |
   Destroyed: <span id="destroyed">0</span> |
-  Weakened (value &lt; 0.95): <span id="weakened">0</span>
+  Weakened: <span id="weakened">0</span> |
+  Hot (&gt; −0.8): <span id="hot">0</span>
 </p>
 <button onclick="resetGrid()">Reset</button>
 <div id="log"></div>
 
 <script>
 const W = 10, H = 10, URL = "http://127.0.0.1:5001";
-let strikes = 0, busy = false, destroyedSet = new Set();
+let strikes = 0, heats = 0, busy = false, destroyedSet = new Set();
 let materials = [];  // "stone" or "sand" per cell, fetched once
+const GRID_CELLS = W * H;  // 100
 
 const grid = document.getElementById("grid");
 const cells = [];
@@ -44,6 +47,7 @@ for (let y = 0; y < H; y++) {
     cell.className = "cell";
     cell.style.background = "#2a6e2a";
     cell.onclick = () => doStrike(x, y);
+    cell.oncontextmenu = (e) => { e.preventDefault(); doHeat(x, y); };
     grid.appendChild(cell);
     cells.push(cell);
   }
@@ -56,33 +60,49 @@ function log(msg) {
 }
 
 function updateGrid(state) {
-  let weakened = 0;
-  for (let i = 0; i < state.length && i < cells.length; i++) {
-    const v = Math.max(-1, Math.min(1, state[i]));
-    const t = (1.0 - v) / 2.0;  // 0=solid, 1=air
+  let weakened = 0, hotCount = 0;
+  for (let i = 0; i < GRID_CELLS && i < cells.length; i++) {
+    // Density: indices 0–99.
+    const dv = Math.max(-1, Math.min(1, state[i]));
+    // Thermal: indices 100–199.
+    const hv = (i + GRID_CELLS < state.length)
+      ? Math.max(-1, Math.min(1, state[i + GRID_CELLS]))
+      : -1;
+    const t = (1.0 - dv) / 2.0;  // 0=solid, 1=air
     const mat = materials[i] || "stone";
     let r, g, b;
     if (t > 0.9) {
-      // Air/destroyed — sky blue (same for both materials)
       r = 135; g = 200; b = 235;
     } else if (mat === "stone") {
-      // Stone: dark slate-gray → light gray-blue
-      r = Math.round(60 + t * 120);
-      g = Math.round(65 + t * 120);
-      b = Math.round(85 + t * 130);
+      r = 60 + t * 120;
+      g = 65 + t * 120;
+      b = 85 + t * 130;
     } else {
-      // Sand: warm golden-brown → pale tan
-      r = Math.round(190 + t * 40);
-      g = Math.round(160 + t * 60);
-      b = Math.round(80 + t * 100);
+      r = 190 + t * 40;
+      g = 160 + t * 60;
+      b = 80 + t * 100;
     }
+    // Heat overlay: blend toward fiery orange (255, 76, 0).
+    if (hv > -0.8) {
+      const ht = (hv + 1.0) / 2.0;   // 0=cold, 1=hot
+      const blend = ht * 0.8;         // max 80% blend
+      r = r * (1.0 - blend) + 255 * blend;
+      g = g * (1.0 - blend) + 76 * blend;
+      b = b * (1.0 - blend) + 0 * blend;
+      hotCount++;
+    }
+    r = Math.round(r); g = Math.round(g); b = Math.round(b);
     cells[i].style.background = `rgb(${r},${g},${b})`;
-    cells[i].textContent = v.toFixed(2);
+    // Show density value; append heat if hot.
+    cells[i].textContent = hv > -0.8
+      ? `${dv.toFixed(1)}|${hv.toFixed(1)}`
+      : dv.toFixed(2);
     cells[i].style.color = t > 0.5 ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.5)";
-    if (v < 0.95) weakened++;
+    if (dv < 0.95) weakened++;
   }
   document.getElementById("weakened").textContent = weakened;
   document.getElementById("destroyed").textContent = destroyedSet.size;
+  document.getElementById("hot").textContent = hotCount;
 }
 
 async function fetchState() {
@@ -93,7 +113,7 @@ async function fetchState() {
     materials = data.materials;
     updateGrid(data.state);
     const stoneCount = materials.filter(m => m === "stone").length;
-    log(`Initial state loaded — ${stoneCount} stone + ${100 - stoneCount} sand`);
+    log(`Initial state loaded — ${stoneCount} stone + ${100 - stoneCount} sand — ${data.state.length} dims`);
   } catch(e) { log("ERROR: " + e.message); }
 }
 
@@ -113,7 +133,29 @@ async function doStrike(x, y) {
     strikes++;
     document.getElementById("strikes").textContent = strikes;
     updateGrid(state);
-    log(`  → cell[${x},${y}]=${state[idx].toFixed(3)}  min=${Math.min(...state).toFixed(3)}  max=${Math.max(...state).toFixed(3)}`);
+    const densitySlice = state.slice(0, GRID_CELLS);
+    log(`  → density[${x},${y}]=${state[idx].toFixed(3)}  min_d=${Math.min(...densitySlice).toFixed(3)}`);
+  } catch(e) { log("ERROR: " + e.message); }
+  busy = false;
+}
+
+async function doHeat(x, y) {
+  if (busy) return;
+  busy = true;
+  const idx = y * W + x;
+  log(`Heat (${x}, ${y}) ...`);
+  try {
+    const r = await fetch(URL + "/heat", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({x, y})
+    });
+    const state = await r.json();
+    heats++;
+    document.getElementById("heats").textContent = heats;
+    updateGrid(state);
+    const thermalVal = state[idx + GRID_CELLS];
+    log(`  → thermal[${x},${y}]=${thermalVal.toFixed(3)}`);
   } catch(e) { log("ERROR: " + e.message); }
   busy = false;
 }
@@ -123,8 +165,10 @@ async function resetGrid() {
     const r = await fetch(URL + "/reset", {method: "POST"});
     const state = await r.json();
     strikes = 0;
+    heats = 0;
     destroyedSet.clear();
     document.getElementById("strikes").textContent = 0;
+    document.getElementById("heats").textContent = 0;
     updateGrid(state);
     log("--- RESET ---");
   } catch(e) { log("ERROR: " + e.message); }

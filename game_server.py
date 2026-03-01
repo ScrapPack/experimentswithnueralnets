@@ -6,9 +6,9 @@ physically simulate a destructible 2D grid.  The network resolves
 physical strikes by minimizing free energy.
 
 World representation:
-    A 10×10 flat tensor of shape (1, 100).  Each cell is in [−1, 1]:
-        +1.0 = solid ground
-        −1.0 = air / empty
+    A 10×10 dual-channel tensor of shape (1, 200).
+    Indices 0–99:   Density (+1.0 = solid, −1.0 = air)
+    Indices 100–199: Thermal (−1.0 = cold, +1.0 = hot)
 
 Materials (Phase 8):
     The grid is split into two materials with per-cell property maps:
@@ -65,9 +65,10 @@ from pc_network import PCNetwork
 
 GRID_W: int = 10
 GRID_H: int = 10
-SENSORY_DIM: int = GRID_W * GRID_H        # 100
+GRID_CELLS: int = GRID_W * GRID_H          # 100 (per channel)
+SENSORY_DIM: int = GRID_CELLS * 2            # 200 (density + thermal)
 
-LAYER_DIMS: list[int] = [32, SENSORY_DIM]
+LAYER_DIMS: list[int] = [32, SENSORY_DIM]    # [32, 200]
 ACTIVATION: str = "tanh"
 
 # Pre-training
@@ -99,10 +100,13 @@ print(f"Device: {device}")
 
 net = PCNetwork(layer_dims=LAYER_DIMS, activation_fn_name=ACTIVATION).to(device)
 print(net)
-print(f"Grid : {GRID_W}×{GRID_H} = {SENSORY_DIM} cells")
+print(f"Grid : {GRID_W}×{GRID_H} = {GRID_CELLS} cells × 2 channels = {SENSORY_DIM} dims")
 
-# World state: every cell starts as solid ground (+1.0).
-current_world_state = torch.ones(1, SENSORY_DIM, device=device)
+# World state: density = solid (+1.0), thermal = cold (−1.0).
+current_world_state = torch.cat([
+    torch.ones(1, GRID_CELLS, device=device),         # density: solid
+    torch.full((1, GRID_CELLS), -1.0, device=device), # thermal: cold
+], dim=1)
 
 # Permanent damage tracking — struck cells never heal.
 destroyed_cells: set[int] = set()
@@ -121,6 +125,15 @@ _GRAVITY_KERNEL = torch.tensor(
     [[0.05, 0.30, 0.05],
      [0.15, 0.00, 0.15],
      [0.02, 0.05, 0.02]],
+    device=device,
+).view(1, 1, 3, 3)
+
+# Thermal radiance kernel — uniform spread in all directions.
+# Heat has no directional bias (unlike gravity-biased structural stress).
+_RADIANCE_KERNEL = torch.tensor(
+    [[0.15, 0.15, 0.15],
+     [0.15, 0.00, 0.15],
+     [0.15, 0.15, 0.15]],
     device=device,
 ).view(1, 1, 3, 3)
 
@@ -181,16 +194,21 @@ def pre_train_physics() -> None:
 
     with torch.no_grad():
         for step in range(PRETRAIN_STEPS):
-            target = torch.ones(1, SENSORY_DIM, device=device)
+            # Density channel: solid baseline.
+            density = torch.ones(1, GRID_CELLS, device=device)
+            # Thermal channel: cold baseline.
+            thermal = torch.full((1, GRID_CELLS), -1.0, device=device)
 
             if step < 150:
-                # Phase 1 — solid with slight noise.
-                target -= torch.rand(1, SENSORY_DIM, device=device) * 0.1
+                # Phase 1 — solid with slight noise (density only).
+                density -= torch.rand(1, GRID_CELLS, device=device) * 0.1
             else:
-                # Phase 2 — random holes.
+                # Phase 2 — random holes (density only).
                 n_holes = torch.randint(1, 6, (1,)).item()
-                hole_idxs = torch.randint(0, SENSORY_DIM, (n_holes,))
-                target[0, hole_idxs] = -1.0
+                hole_idxs = torch.randint(0, GRID_CELLS, (n_holes,))
+                density[0, hole_idxs] = -1.0
+
+            target = torch.cat([density, thermal], dim=1)  # (1, 200)
 
             net.infer(target, steps=PRETRAIN_INFER_STEPS, eta_x=PRETRAIN_ETA_X)
             net.learn(eta_w=PRETRAIN_ETA_W, eta_v=PRETRAIN_ETA_V)
@@ -235,11 +253,12 @@ def _propagate_stress(
         Sand  lateral:  0.15 × 0.40 = 0.060
 
     Args:
-        state:  (1, 100) current world state.
-        stress: (1, 100) stress seeded at the struck cell only.
+        state:  (1, 200) full world state (density + thermal).
+        stress: (1, 100) stress seeded at the struck cell only
+                (density-grid indices).
 
     Returns:
-        (1, 100) weakened world state.
+        (1, 200) world state with density slice weakened.
     """
     result = state.clone()
 
@@ -254,9 +273,46 @@ def _propagate_stress(
         conv_result = conv_result * _tensile_map_2d
         spread = torch.max(spread, conv_result)
 
-    # Flatten and apply weakening (only weaken, never strengthen).
-    weakening = spread.view(1, SENSORY_DIM) * STRESS_SCALE
-    result = (result - weakening).clamp(-1.0, 1.0)
+    # Flatten and apply weakening to density slice only (0–99).
+    weakening = spread.view(1, GRID_CELLS) * STRESS_SCALE
+    result[:, :GRID_CELLS] = (
+        result[:, :GRID_CELLS] - weakening
+    ).clamp(-1.0, 1.0)
+
+    return result
+
+
+def _propagate_heat(
+    state: torch.Tensor,
+    stress: torch.Tensor,
+) -> torch.Tensor:
+    """Propagate thermal stress with the uniform radiance kernel.
+
+    Same max-propagation strategy as structural stress, but:
+      - Uses _RADIANCE_KERNEL (uniform, no directional bias).
+      - No tensile dampening — heat flows freely through all materials.
+      - Operates on the thermal slice (indices 100–199).
+      - ADDS heat energy (moves toward +1.0) instead of weakening.
+
+    Args:
+        state:  (1, 200) full world state.
+        stress: (1, 100) thermal stress seeded at the heated cell.
+
+    Returns:
+        (1, 200) world state with thermal slice heated.
+    """
+    result = state.clone()
+
+    spread = stress.view(1, 1, GRID_H, GRID_W)
+    for _ in range(PROPAGATION_PASSES):
+        padded = F.pad(spread, [1, 1, 1, 1], mode="constant", value=0.0)
+        spread = torch.max(spread, F.conv2d(padded, _RADIANCE_KERNEL))
+
+    # Add heat to the thermal slice (100–199).
+    heating = spread.view(1, GRID_CELLS) * STRESS_SCALE
+    result[:, GRID_CELLS:] = (
+        result[:, GRID_CELLS:] + heating
+    ).clamp(-1.0, 1.0)
 
     return result
 
@@ -279,10 +335,11 @@ def get_state():
 
     Returns JSON::
 
-        {"state": [100 floats], "materials": [100 strings]}
+        {"state": [200 floats], "materials": [100 strings]}
 
-    ``materials`` is a flat list of ``"stone"`` or ``"sand"`` for each
-    cell (row-major).  Materials are static — they never change.
+    ``state`` contains 200 values: indices 0–99 are density,
+    indices 100–199 are thermal.  ``materials`` is a flat list of
+    ``"stone"`` or ``"sand"`` for each cell (row-major, 100 entries).
     """
     state_list = current_world_state.squeeze(0).cpu().tolist()
     return jsonify({"state": state_list, "materials": _material_labels})
@@ -299,7 +356,7 @@ def strike():
     4. Weaken cells proportionally; destroyed cells stay at −1.
 
     Expects JSON: ``{"x": <int>, "y": <int>}``
-    Returns: flat JSON list of 100 floats (the new world state).
+    Returns: flat JSON list of 200 floats (the new world state).
     """
     global current_world_state
 
@@ -341,11 +398,11 @@ def strike():
             flush=True,
         )
 
-        stress = torch.zeros(1, SENSORY_DIM, device=device)
+        stress = torch.zeros(1, GRID_CELLS, device=device)
         stress[0, idx] = stress_magnitude
 
         # 4. Propagate stress spatially (gravity-biased max-propagation)
-        #    and weaken cells proportionally.
+        #    and weaken cells proportionally (density slice only).
         current_world_state = _propagate_stress(current_world_state, stress)
 
         # 5. Destroyed cells are always −1.
@@ -358,7 +415,7 @@ def strike():
         #    chain reactions.
         for _settle in range(MAX_SETTLE_ROUNDS):
             newly_collapsed: list[tuple[int, float]] = []
-            for i in range(SENSORY_DIM):
+            for i in range(GRID_CELLS):
                 val = current_world_state[0, i].item()
                 y_i = i // GRID_W
                 x_i = i % GRID_W
@@ -388,7 +445,7 @@ def strike():
                 cascade_stress = (
                     abs(old_v + 1.0) * precision_map[y_i, x_i].item()
                 )
-                stress = torch.zeros(1, SENSORY_DIM, device=device)
+                stress = torch.zeros(1, GRID_CELLS, device=device)
                 stress[0, i] = cascade_stress
                 current_world_state = _propagate_stress(
                     current_world_state, stress,
@@ -407,12 +464,73 @@ def strike():
     return jsonify(state_list)
 
 
+@app.route("/heat", methods=["POST"])
+def heat():
+    """Apply heat to a cell and propagate thermal energy.
+
+    1. Force the cell's thermal value to +1.0 (maximum heat).
+    2. Run inference — the network reacts to the thermal anomaly.
+    3. Propagate thermal stress with the radiance kernel (uniform,
+       no tensile dampening — heat flows freely).
+
+    Expects JSON: ``{"x": <int>, "y": <int>}``
+    Returns: flat JSON list of 200 floats (the new world state).
+    """
+    global current_world_state
+
+    data = request.get_json()
+    x = int(data["x"])
+    y = int(data["y"])
+
+    if not (0 <= x < GRID_W and 0 <= y < GRID_H):
+        return jsonify({"error": f"({x}, {y}) out of bounds"}), 400
+
+    grid_idx = y * GRID_W + x
+    thermal_idx = grid_idx + GRID_CELLS  # offset into thermal slice
+
+    with torch.no_grad():
+        old_thermal = current_world_state[0, thermal_idx].item()
+
+        # 1. Force maximum heat at the target cell.
+        current_world_state[0, thermal_idx] = 1.0
+
+        # 2. Run inference — the network settles given the thermal spike.
+        net.infer(
+            current_world_state, steps=STRIKE_INFER_STEPS, eta_x=STRIKE_ETA_X,
+        )
+
+        # 3. Thermal stress = surprise at this cell.
+        #    A cold cell (−1 → +1) produces maximum stress (2.0);
+        #    an already-warm cell (0.5 → +1) produces less (0.5).
+        thermal_stress = abs(old_thermal - 1.0)
+        mat_label = "stone" if x < 5 else "sand"
+        print(
+            f"  Heat ({x},{y}) idx={grid_idx} [{mat_label}]  "
+            f"old_t={old_thermal:.3f}  stress={thermal_stress:.3f}",
+            flush=True,
+        )
+
+        # 4. Propagate thermal stress with the radiance kernel.
+        stress = torch.zeros(1, GRID_CELLS, device=device)
+        stress[0, grid_idx] = thermal_stress
+        current_world_state = _propagate_heat(current_world_state, stress)
+
+        # 5. Ensure destroyed density cells stay destroyed.
+        _force_destroyed(current_world_state)
+
+    state_list = current_world_state.squeeze(0).cpu().tolist()
+    return jsonify(state_list)
+
+
 @app.route("/reset", methods=["POST"])
 def reset():
-    """Reset the world to fully solid."""
+    """Reset the world: density → solid, thermal → cold."""
     global current_world_state
     destroyed_cells.clear()
-    current_world_state = torch.ones(1, SENSORY_DIM, device=device)
+    current_world_state = torch.cat([
+        torch.ones(1, GRID_CELLS, device=device),
+        torch.full((1, GRID_CELLS), -1.0, device=device),
+    ], dim=1)
     return jsonify(current_world_state.squeeze(0).cpu().tolist())
 
 
@@ -423,7 +541,8 @@ def reset():
 if __name__ == "__main__":
     pre_train_physics()
     print(f"Server ready → http://127.0.0.1:5001")
-    print(f"  GET  /get_state   — fetch the 10×10 world")
-    print(f"  POST /strike      — destroy a block (JSON: {{x, y}})")
+    print(f"  GET  /get_state   — fetch 200-dim state (density + thermal)")
+    print(f"  POST /strike      — destroy a block   (JSON: {{x, y}})")
+    print(f"  POST /heat        — heat a block      (JSON: {{x, y}})")
     print(f"  POST /reset       — restore the grid\n")
     app.run(host="127.0.0.1", port=5001, debug=False)
