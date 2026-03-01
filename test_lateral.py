@@ -1,21 +1,39 @@
 """
-Test: Lateral Consensus Defeats Occlusion
+Test: Lateral Consensus Defeats Occlusion (Sensory Attenuation)
 
 Validates the CorticalGrid's emergent consensus behaviour.  A 3×3 grid
 of CorticalColumns is trained on a coherent 9×9 image (a cross / + pattern).
-After training, the centre column's sensory input is completely zeroed out
-(simulating occlusion), and the grid is re-run.
+After training, the centre column's sensory precision (pi_sensory) is dropped
+to zero — the biological mechanism for occlusion / unreliable input — and
+the grid is re-run on the *unmodified* image.
 
-The lateral connections should pull the occluded column's x_obj toward
-the consensus of its neighbours, effectively "filling in" the missing
-information purely through local ODE dynamics and Hebbian-learned
+Because pi_sensory = 0, the centre column's sensory error term vanishes
+from both the ODE and the energy, leaving *only* lateral consensus (err_lat)
+and state decay.  The lateral connections should pull the occluded column's
+x_obj toward the consensus of its neighbours, effectively "filling in" the
+missing information purely through local ODE dynamics and Hebbian-learned
 lateral weights.
 
+This is the biologically correct mechanism: sensory attenuation (precision
+weighting), not data manipulation (zeroing the patch).
+
+Training uses strong lateral precision (pi_lat = 6.0) to enforce Thousand
+Brains consensus: columns seeing identical patches MUST converge to the
+same representation.  Without this, dendritic gating's multiplicative
+interaction creates spurious local minima where columns with identical
+sensory input diverge based on random initialisation.
+
+Anti-cheat guarantees:
+    1. No manual x_obj assignment during inference — states settle via FEP ODEs.
+    2. The global grid.infer() integration loop is used, not manual column stepping.
+    3. Because pi_sensory = 0.0 the centre column has zero mathematical resistance
+       to its neighbours, so cosine similarity to the trained state should be > 0.95.
+
 What to look for:
-    1. After training, all columns converge on similar x_obj representations.
-    2. With occlusion, the centre column's x_obj is reconstructed from
-       its neighbours — cosine similarity should be high.
-    3. Energy should decrease during inference even with occlusion.
+    1. After training, columns seeing the same patch converge to similar x_obj.
+    2. With sensory attenuation, the centre column's x_obj is reconstructed
+       from its neighbours — cosine similarity to trained state should be > 0.95.
+    3. Energy should decrease during inference even with attenuation.
     4. No autograd.  All dynamics are local ODEs + Hebbian learning.
 """
 
@@ -106,18 +124,30 @@ def main() -> None:
     # 3. Training: teach the grid the cross pattern
     # -----------------------------------------------------------------
     print("Phase 1: Training on cross pattern...")
+    print("  (pi_lat = 6.0: strong lateral consensus enforces Thousand Brains voting)")
 
-    N_EPOCHS = 200
+    N_EPOCHS = 400
     INFER_STEPS = 50
     ETA_X = 0.1
     ETA_W = 0.01
+
+    # Strong lateral precision during training.
+    # Biologically justified: the Thousand Brains theory requires columns
+    # seeing the same object to converge to the same representation.
+    # In the cross pattern, the centre and all 4 neighbours see identical
+    # all-ones patches.  Without strong lateral coupling, dendritic gating's
+    # multiplicative interaction creates spurious local minima where columns
+    # with identical input diverge based on random init.
+    PI_LAT_TRAIN = 6.0
+    for col in grid.columns:
+        col.pi_lat = PI_LAT_TRAIN
 
     with torch.no_grad():
         for epoch in range(N_EPOCHS):
             history = grid.infer(cross, steps=INFER_STEPS, eta_x=ETA_X)
             grid.learn(cross, eta_w=ETA_W)
 
-            if epoch % 20 == 0 or epoch == N_EPOCHS - 1:
+            if epoch % 30 == 0 or epoch == N_EPOCHS - 1:
                 print(f"  epoch {epoch:3d}  "
                       f"start={history[0]:.4f}  end={history[-1]:.4f}")
 
@@ -154,36 +184,35 @@ def main() -> None:
     print(f"\n  Centre column (idx={centre_idx}) trained x_obj norm: "
           f"{centre_trained.norm().item():.4f}")
 
-    # Average x_obj of all columns (full-info baseline).
-    avg_trained = torch.stack(trained_x_objs, dim=0).mean(dim=0)  # (1, obj_dim)
+    # Show similarity of centre to each neighbour.
+    nbr_idxs = grid._neighbor_idx[centre_idx]
+    for n in nbr_idxs:
+        sim = cosine_sim(centre_trained, trained_x_objs[n])
+        print(f"    vs col{n} (neighbour): {sim:.4f}")
 
     # -----------------------------------------------------------------
-    # 4. Test: occlude the centre column and re-infer
+    # 4. Test: sensory attenuation on centre column and re-infer
     # -----------------------------------------------------------------
-    print("\nPhase 2: Occlusion test — centre column receives ZERO input")
+    print("\nPhase 2: Sensory attenuation — centre column pi_sensory = 0.0")
+    print("  (Full cross image passed; centre column ignores sensory input)")
 
-    # Create occluded input: same as cross, but centre patch zeroed.
-    occluded = cross.clone()
-    img_occluded = occluded.reshape(1, GRID_H * PATCH_H, GRID_W * PATCH_W)
-    r0 = (GRID_H // 2) * PATCH_H
-    c0 = (GRID_W // 2) * PATCH_W
-    img_occluded[:, r0:r0 + PATCH_H, c0:c0 + PATCH_W] = 0.0
-    occluded = img_occluded.reshape(1, -1)
+    # Biological occlusion: drop sensory precision to zero.
+    # The column's ODE term -(pi_sensory * grad) becomes zero, leaving
+    # only lateral consensus (err_lat) and state decay (-alpha * x) active.
+    # No data manipulation — the raw cross image is passed unchanged.
+    #
+    # ODE equilibrium for the attenuated column:
+    #   0 = -pi_lat * (x - W_lat @ nbr_avg) - alpha * x
+    #   x* = (pi_lat / (pi_lat + alpha)) * W_lat @ nbr_avg
+    grid.columns[centre_idx].pi_sensory = 0.0
 
-    print("  Occluded pattern (9×9):")
-    occ_2d = occluded.reshape(GRID_H * PATCH_H, GRID_W * PATCH_W)
-    for r in range(GRID_H * PATCH_H):
-        row_str = "    "
-        for c in range(GRID_W * PATCH_W):
-            row_str += "██" if occ_2d[r, c].item() > 0.5 else "  "
-        print(row_str)
-    print()
-
-    # Infer on occluded input.
     # Same seed as capture run → same random init in reset_states().
     torch.manual_seed(999)
     with torch.no_grad():
-        occ_history = grid.infer(occluded, steps=INFER_STEPS * 2, eta_x=ETA_X)
+        occ_history = grid.infer(cross, steps=INFER_STEPS * 4, eta_x=ETA_X)
+
+    # Restore sensory precision for future use.
+    grid.columns[centre_idx].pi_sensory = 1.0
 
     occ_energy = occ_history[-1]
     occluded_x_objs = [col.x_obj.clone() for col in grid.columns]
@@ -192,24 +221,25 @@ def main() -> None:
     # -----------------------------------------------------------------
     # 5. Control: truly isolated columns (no lateral connections)
     # -----------------------------------------------------------------
-    print("Phase 3: Control — same occlusion, columns settle INDEPENDENTLY")
+    print("\nPhase 3: Control — same attenuation, columns settle INDEPENDENTLY")
 
     # Run each column individually WITHOUT neighbor_context.
-    # This is the proper ablation: columns see the same sensory patches
-    # but have zero lateral influence.
+    # This is the proper ablation: the centre column has pi_sensory=0.0
+    # and NO lateral connections, so it receives zero information and
+    # should decay to near-zero via the state decay prior.
     B = 1
 
-    # Slice the occluded image the same way CorticalGrid does.
-    occ_img = occluded.reshape(B, GRID_H * PATCH_H, GRID_W * PATCH_W)
+    # Slice the FULL cross image the same way CorticalGrid does.
+    full_img = cross.reshape(B, GRID_H * PATCH_H, GRID_W * PATCH_W)
     ctrl_patches: list[torch.Tensor] = []
     for r in range(GRID_H):
         for c in range(GRID_W):
             y0 = r * PATCH_H
             x0 = c * PATCH_W
-            patch = occ_img[:, y0:y0 + PATCH_H, x0:x0 + PATCH_W]
+            patch = full_img[:, y0:y0 + PATCH_H, x0:x0 + PATCH_W]
             ctrl_patches.append(patch.reshape(B, grid.sensory_dim))
 
-    # Build isolated columns with the SAME trained W_obj/W_loc weights.
+    # Build isolated columns with the SAME trained weights.
     from pc_layer import CorticalColumn
     isolated_cols: list[CorticalColumn] = []
     for src in grid.columns:
@@ -220,7 +250,12 @@ def main() -> None:
         ).to(device)
         iso.W_obj.data.copy_(src.W_obj.data)
         iso.W_loc.data.copy_(src.W_loc.data)
+        # Match training lateral precision.
+        iso.pi_lat = PI_LAT_TRAIN
         isolated_cols.append(iso)
+
+    # Match the occlusion condition: centre column has pi_sensory = 0.0.
+    isolated_cols[centre_idx].pi_sensory = 0.0
 
     # Settle each isolated column independently — NO neighbor_context.
     # Same seed as capture run → same random init for fair comparison.
@@ -228,13 +263,16 @@ def main() -> None:
     with torch.no_grad():
         for iso in isolated_cols:
             iso.reset_states(B, device)
-        for _ in range(INFER_STEPS * 2):
+        for _ in range(INFER_STEPS * 4):
             for iso, patch in zip(isolated_cols, ctrl_patches):
                 iso.infer_step(patch, eta_x=ETA_X)  # no neighbor_context!
 
     ctrl_energy = sum(iso.get_energy() for iso in isolated_cols)
     control_x_objs = [iso.x_obj.clone() for iso in isolated_cols]
     centre_control = control_x_objs[centre_idx]
+
+    # Restore for cleanliness.
+    isolated_cols[centre_idx].pi_sensory = 1.0
 
     # -----------------------------------------------------------------
     # 6. Analysis
@@ -252,19 +290,32 @@ def main() -> None:
     print(f"    Without lateral (control):   {sim_control:.4f}")
     print(f"    Improvement:                 {sim_lateral - sim_control:+.4f}")
 
+    # Lateral equilibrium target: theoretical convergence point.
+    # At equilibrium: x* = (pi_lat / (pi_lat + alpha)) * W_lat @ nbr_avg.
+    centre_col = grid._col(GRID_H // 2, GRID_W // 2)
+    nbr_avg_settled = torch.stack(
+        [occluded_x_objs[n] for n in nbr_idxs], dim=0
+    ).mean(dim=0)  # (1, obj_dim)
+    lateral_target = (
+        PI_LAT_TRAIN / (PI_LAT_TRAIN + centre_col.alpha)
+    ) * (nbr_avg_settled @ centre_col.W_lat.t())
+    sim_to_target = cosine_sim(centre_occluded, lateral_target)
+    print(f"\n  Centre cosine to lateral equilibrium target: {sim_to_target:.4f}")
+    print(f"    (validates ODE convergence — should be near 1.0)")
+
     # Norm comparison: does the occluded column develop a meaningful representation?
     norm_lateral = centre_occluded.norm().item()
     norm_control = centre_control.norm().item()
     norm_trained = centre_trained.norm().item()
     print(f"\n  Centre column x_obj norm:")
     print(f"    Trained (full info):         {norm_trained:.4f}")
-    print(f"    Occluded + lateral:          {norm_lateral:.4f}")
-    print(f"    Occluded + no lateral:       {norm_control:.4f}")
+    print(f"    Attenuated + lateral:        {norm_lateral:.4f}")
+    print(f"    Attenuated + no lateral:     {norm_control:.4f}")
 
     # Energy comparison.
     print(f"\n  Final inference energy:")
-    print(f"    Occluded + lateral:          {occ_energy:.4f}")
-    print(f"    Occluded + no lateral:       {ctrl_energy:.4f}")
+    print(f"    Attenuated + lateral:        {occ_energy:.4f}")
+    print(f"    Attenuated + no lateral:     {ctrl_energy:.4f}")
 
     # Energy decrease check.
     occ_decreased = occ_history[-1] < occ_history[0]
@@ -273,7 +324,6 @@ def main() -> None:
           f"({occ_history[0]:.2f} → {occ_history[-1]:.2f})")
 
     # Neighbour similarity: occluded centre vs its 4 neighbours.
-    nbr_idxs = grid._neighbor_idx[centre_idx]
     nbr_sims_lat = [
         cosine_sim(centre_occluded, occluded_x_objs[n])
         for n in nbr_idxs
@@ -290,7 +340,6 @@ def main() -> None:
     print(f"    Without lateral:             {avg_nbr_sim_ctrl:.4f}")
 
     # W_lat diverged from identity.
-    centre_col = grid._col(GRID_H // 2, GRID_W // 2)
     w_lat_delta = (
         centre_col.W_lat.data - torch.eye(OBJ_DIM, device=device)
     ).abs().sum().item()
@@ -311,42 +360,56 @@ def main() -> None:
         checks.append(("Lateral > control similarity", False))
         passed = False
 
-    # Check 2: Lateral cosine similarity positive and meaningful.
-    # With multiplicative dendritic gating, the occluded column converges
-    # toward the neighbour average (which is not identical to the sensory-
-    # driven representation).  The key evidence is the improvement over
-    # control and the high centre-vs-neighbours similarity.
-    if sim_lateral > 0.1:
-        checks.append(("Lateral similarity > 0.1", True))
+    # Check 2: Lateral cosine similarity near-perfect.
+    # With pi_sensory=0 and strong lateral coupling, the centre column has
+    # zero resistance to its neighbours.  Because the centre and all 4
+    # neighbours see identical all-ones patches, the trained representations
+    # should be similar, and lateral consensus should reconstruct > 0.95.
+    if sim_lateral > 0.95:
+        checks.append(("Lateral similarity > 0.95 (near-perfect reconstruction)", True))
     else:
-        checks.append(("Lateral similarity > 0.1", False))
+        checks.append(("Lateral similarity > 0.95 (near-perfect reconstruction)", False))
         passed = False
 
-    # Check 3: Energy decreased during occluded inference.
+    # Check 3: ODE convergence — centre reached lateral equilibrium target.
+    if sim_to_target > 0.95:
+        checks.append(("ODE converged to lateral equilibrium (> 0.95)", True))
+    else:
+        checks.append(("ODE converged to lateral equilibrium (> 0.95)", False))
+        passed = False
+
+    # Check 4: Energy decreased during attenuated inference.
     if occ_decreased:
         checks.append(("Energy decreased", True))
     else:
         checks.append(("Energy decreased", False))
         passed = False
 
-    # Check 4: Centre x_obj norm is meaningful (not near zero).
-    # The sensory pathway (zero input) competes with lateral pull,
-    # so the magnitude is naturally attenuated.  The direction (cosine)
-    # is the primary validation; norm > 30% confirms meaningful recovery.
-    if norm_lateral > 0.3 * norm_trained:
-        checks.append(("Occluded norm > 30% of trained", True))
+    # Check 5: Centre x_obj norm is meaningful (not near zero).
+    # With pi_sensory=0, the column gets all signal from lateral consensus.
+    # Norm should be close to the trained norm.
+    if norm_lateral > 0.5 * norm_trained:
+        checks.append(("Attenuated norm > 50% of trained", True))
     else:
-        checks.append(("Occluded norm > 30% of trained", False))
+        checks.append(("Attenuated norm > 50% of trained", False))
         passed = False
 
-    # Check 5: W_lat learned (diverged from identity).
+    # Check 6: W_lat learned (diverged from identity).
     if w_lat_delta > 0.1:
         checks.append(("W_lat diverged from identity", True))
     else:
         checks.append(("W_lat diverged from identity", False))
         passed = False
 
-    # Check 6: No autograd.
+    # Check 7: Control centre column decayed (near-zero norm) — proves
+    # lateral consensus is the sole source of reconstruction.
+    if norm_control < 0.3 * norm_trained:
+        checks.append(("Control centre decayed (no info without lateral)", True))
+    else:
+        checks.append(("Control centre decayed (no info without lateral)", False))
+        passed = False
+
+    # Check 8: No autograd.
     all_no_grad = all(
         not p.requires_grad for p in grid.parameters()
     )
@@ -360,7 +423,7 @@ def main() -> None:
 
     print(f"\n{'='*68}")
     if passed:
-        print("PASS: Lateral consensus fills in occluded column via emergent voting.")
+        print("PASS: Lateral consensus fills in attenuated column via sensory precision.")
     else:
         print("INVESTIGATE: Some checks failed — lateral consensus may need tuning.")
     print(f"{'='*68}")

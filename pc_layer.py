@@ -9,7 +9,7 @@ Phase 2 adds **lateral connections** (W_lat) between neighbouring columns.
 Phase 3 adds **top-down priors** from a higher-level column, enabling
 hierarchical attention.
 Phase 4 adds **temporal prediction** (W_trans) with memory (x_obj_prev).
-Phase 4.5 upgrades to **dendritic gating** (multiplicative interaction)
+Phase 4.5 upgrades to **dendritic gating** (pre-multiplication activation)
 and **non-linear temporal transitions**, with overcomplete latent spaces.
 Phase 4.6 adds **precision weighting** (Π scalars) for each error modality
 and a **Gaussian prior** (state decay) on latent variables.
@@ -19,14 +19,17 @@ With this convention, ∇F aligns with the raw error products, so every
 ODE and weight update uses strict subtraction for gradient descent.
 
 Mathematical foundation (Free Energy Principle):
-    - L2/3 generative prediction (dendritic gating):
-          pred_obj = W_obj @ x_obj
-          pred_loc = W_loc @ x_loc
-          prediction = tanh(pred_obj * pred_loc)   # element-wise multiply
+    - L2/3 generative prediction (pre-multiplication activation):
+          z_obj = W_obj @ x_obj
+          z_loc = W_loc @ x_loc
+          pred_obj = activation(z_obj)              # bounded independently
+          pred_loc = activation(z_loc)              # bounded independently
+          prediction = pred_obj * pred_loc          # element-wise gating
     - L4 sensory error (Convention B):
           ε = prediction - sensory_input
-    - Scaled error (chain rule through activation):
-          err_scaled = ε * activation_deriv(composite)
+    - Scaled errors (product-rule chain rule, two independent derivatives):
+          err_scaled_obj = ε * pred_loc * activation_deriv(z_obj)
+          err_scaled_loc = ε * pred_obj * activation_deriv(z_loc)
     - Lateral consensus error (Phase 2):
           err_lat = x_obj - W_lat @ neighbor_context
     - Top-down attention error (Phase 3):
@@ -34,10 +37,10 @@ Mathematical foundation (Free Energy Principle):
     - Temporal prediction error (Phase 4, non-linear):
           err_time = x_obj - tanh(W_trans @ x_obj_prev)
     - Internal ODE settling (gradient descent, all terms subtract):
-          dx_obj = - π_s * W_obj.T @ (err_scaled * pred_loc)
+          dx_obj = - π_s * W_obj.T @ err_scaled_obj
                    - π_l * err_lat - π_td * err_td - π_t * err_time
                    - α * x_obj
-          dx_loc = - π_s * W_loc.T @ (err_scaled * pred_obj) - α * x_loc
+          dx_loc = - π_s * W_loc.T @ err_scaled_loc - α * x_loc
     - L5 motor action (Active Inference, precision-scaled):
           action = +eta_a * π_s * (sensory_gradient.T @ ε)
     - Variational Free Energy (precision-weighted):
@@ -45,8 +48,8 @@ Mathematical foundation (Free Energy Principle):
             + ½ π_td ||err_td||² + ½ π_t ||err_time||²
             + ½ α (||x_obj||² + ||x_loc||²)
     - Weight learning (precision-scaled gradient descent):
-          W_obj -= η * (π_s * err_scaled * pred_loc).T @ x_obj
-          W_loc -= η * (π_s * err_scaled * pred_obj).T @ x_loc
+          W_obj -= η * (π_s * err_scaled_obj).T @ x_obj
+          W_loc -= η * (π_s * err_scaled_loc).T @ x_loc
           W_lat += η * (π_l * err_lat).T @ neighbor_context     (prior: additive)
           W_trans += η * (π_t * err_time_scaled).T @ x_obj_prev  (prior: additive)
             where err_time_scaled = err_time * activation_deriv(temporal_z)
@@ -148,9 +151,11 @@ class CorticalColumn(nn.Module):
         x_obj_prev : (batch, obj_dim)    — previous x_obj (set by step_time()).
 
     Cached intermediates (set by infer_step, consumed by learn):
-        _pred_obj      : (batch, sensory_dim) — object pathway pre-gate.
-        _pred_loc      : (batch, sensory_dim) — location pathway pre-gate.
-        _prediction    : (batch, sensory_dim) — tanh(pred_obj * pred_loc).
+        _z_obj         : (batch, sensory_dim) — raw linear projection (pre-activation).
+        _z_loc         : (batch, sensory_dim) — raw linear projection (pre-activation).
+        _pred_obj      : (batch, sensory_dim) — activated object pathway.
+        _pred_loc      : (batch, sensory_dim) — activated location pathway.
+        _prediction    : (batch, sensory_dim) — pred_obj * pred_loc.
         _temporal_pred : (batch, obj_dim)     — tanh(W_trans @ x_obj_prev).
 
     Parameters (slow dynamics — Hebbian learning):
@@ -159,16 +164,20 @@ class CorticalColumn(nn.Module):
         W_lat   : (obj_dim, obj_dim)     — lateral weights (Phase 2).
         W_trans : (obj_dim, obj_dim)     — temporal transition matrix (Phase 4).
 
-    Dendritic gating (Phase 4.5) — multiplicative prediction:
-        pred_obj = W_obj @ x_obj
-        pred_loc = W_loc @ x_loc
-        prediction = tanh(pred_obj * pred_loc)   # element-wise multiply
+    Dendritic gating (pre-multiplication activation) — eliminates dead zone:
+        z_obj = W_obj @ x_obj
+        z_loc = W_loc @ x_loc
+        pred_obj = activation(z_obj)      # bounded independently
+        pred_loc = activation(z_loc)      # bounded independently
+        prediction = pred_obj * pred_loc  # element-wise gating
 
-    Convention B (ε = p − s): the product rule gives gated gradients,
+    Convention B (ε = p − s): the product rule gives two gated gradients,
     and gradient descent uses strict subtraction on all terms:
-        dx_obj = -W_obj.T @ (err_scaled * pred_loc) - err_lat - err_td - err_time
-        dx_loc = -W_loc.T @ (err_scaled * pred_obj)
-      where err_scaled = error * activation_deriv(composite)  [error = prediction - input]
+        err_scaled_obj = error * pred_loc * activation_deriv(z_obj)
+        err_scaled_loc = error * pred_obj * activation_deriv(z_loc)
+        dx_obj = -W_obj.T @ err_scaled_obj - err_lat - err_td - err_time
+        dx_loc = -W_loc.T @ err_scaled_loc
+      [error = prediction - input]
 
     Non-linear temporal (Phase 4.5):
         temporal_pred = tanh(W_trans @ x_obj_prev)
@@ -272,10 +281,11 @@ class CorticalColumn(nn.Module):
         self.alpha = 0.05
 
         # --- Cached intermediates for gated gradients ---
-        self._pred_obj = None       # x_obj @ W_obj.T  (cached for learn)
-        self._pred_loc = None       # x_loc @ W_loc.T  (cached for learn)
-        self._prediction = None     # activation(pred_obj * pred_loc) (cached for learn)
-        self._composite = None      # pred_obj * pred_loc (pre-activation, for deriv)
+        self._z_obj = None          # x_obj @ W_obj.T  (pre-activation, for deriv)
+        self._z_loc = None          # x_loc @ W_loc.T  (pre-activation, for deriv)
+        self._pred_obj = None       # activation(z_obj)  (post-activation, for cross-gate)
+        self._pred_loc = None       # activation(z_loc)  (post-activation, for cross-gate)
+        self._prediction = None     # pred_obj * pred_loc  (final prediction)
         self._temporal_pred = None  # activation(x_obj_prev @ W_trans.T) (cached for learn)
         self._temporal_z = None     # x_obj_prev @ W_trans.T (pre-activation, for deriv)
 
@@ -289,8 +299,8 @@ class CorticalColumn(nn.Module):
         """Initialise all fast states for a new observation.
 
         x_obj and x_loc are initialised to small random values (not zeros)
-        to bootstrap the multiplicative dendritic gate — with pure zeros,
-        pred_obj * pred_loc = 0 and all gradients vanish.
+        to break symmetry and bootstrap the dendritic gate — with pure
+        zeros, pred_obj * pred_loc = 0 and no gradient flows.
 
         Note: x_obj_prev is NOT zeroed — temporal memory persists across
         observations within a sequence.  Only step_time() or direct
@@ -303,9 +313,9 @@ class CorticalColumn(nn.Module):
         if device is None:
             device = self.W_obj.device
 
-        # Random init for dendritic gating bootstrap (Phase 4.5).
-        # Scale 0.1 provides enough gate signal for gradients to flow
-        # through the multiplicative interaction from the first step.
+        # Random init to break symmetry and bootstrap the dendritic gate.
+        # Scale 0.1 provides enough signal for gradients to flow through
+        # the multiplicative interaction from the first step.
         self.x_obj = 0.1 * torch.randn(batch_size, self.obj_dim, device=device)
         self.x_loc = 0.1 * torch.randn(batch_size, self.loc_dim, device=device)
         self.error = torch.zeros(batch_size, self.sensory_dim, device=device)
@@ -314,10 +324,11 @@ class CorticalColumn(nn.Module):
         self.err_time = torch.zeros(batch_size, self.obj_dim, device=device)
 
         # Clear cached intermediates.
+        self._z_obj = None
+        self._z_loc = None
         self._pred_obj = None
         self._pred_loc = None
         self._prediction = None
-        self._composite = None
         self._temporal_pred = None
         self._temporal_z = None
 
@@ -328,24 +339,30 @@ class CorticalColumn(nn.Module):
     def predict_down(self) -> tuple[Tensor, Tensor, Tensor]:
         """Compute the L2/3 generative prediction via dendritic gating.
 
-        Phase 4.5: Uses multiplicative (dendritic) gating instead of
-        additive composition.  Location gates object identity:
+        Pre-multiplication activation: activation is applied to each
+        pathway independently BEFORE the multiplicative interaction.
+        This keeps both streams bounded (e.g. [-1, 1] for tanh),
+        preventing the pre-activation product from exploding into the
+        activation's flat asymptotes (the "Asymptotic Dead Zone").
 
         .. math::
-            p_{obj} = x_{obj} \\cdot W_{obj}^T
-            p_{loc} = x_{loc} \\cdot W_{loc}^T
-            \\text{prediction} = \\text{activation}(p_{obj} * p_{loc})
+            z_{obj} = x_{obj} \\cdot W_{obj}^T
+            z_{loc} = x_{loc} \\cdot W_{loc}^T
+            p_{obj} = \\text{activation}(z_{obj})
+            p_{loc} = \\text{activation}(z_{loc})
+            \\text{prediction} = p_{obj} * p_{loc}
 
         Returns:
             (prediction, pred_obj, pred_loc) where:
                 prediction: (batch, sensory_dim) — gated prediction.
-                pred_obj:   (batch, sensory_dim) — object pathway pre-gate.
-                pred_loc:   (batch, sensory_dim) — location pathway pre-gate.
+                pred_obj:   (batch, sensory_dim) — activated object pathway.
+                pred_loc:   (batch, sensory_dim) — activated location pathway.
         """
-        pred_obj = self.x_obj @ self.W_obj.t()    # (B, sensory_dim)
-        pred_loc = self.x_loc @ self.W_loc.t()    # (B, sensory_dim)
-        composite = pred_obj * pred_loc            # element-wise gating
-        prediction = self.activation_fn(composite)
+        z_obj = self.x_obj @ self.W_obj.t()       # (B, sensory_dim)
+        z_loc = self.x_loc @ self.W_loc.t()       # (B, sensory_dim)
+        pred_obj = self.activation_fn(z_obj)       # bounded
+        pred_loc = self.activation_fn(z_loc)       # bounded
+        prediction = pred_obj * pred_loc           # element-wise gating
         return prediction, pred_obj, pred_loc
 
     # ------------------------------------------------------------------
@@ -388,16 +405,16 @@ class CorticalColumn(nn.Module):
         ``grad_obj`` is the positive gradient ∇F.  All ODE terms use
         strict subtraction for gradient descent on free energy.
 
-        Dendritic gating (Phase 4.5): prediction = tanh(pred_obj * pred_loc).
+        Pre-multiplication activation: prediction = activation(z_obj) * activation(z_loc).
         Precision weighting and state decay (Phase 4.6).
 
         .. math::
-            dx_{obj} = - \\pi_s \\cdot W_{obj}^T (\\text{err\\_scaled} \\ast p_{loc})
+            dx_{obj} = - \\pi_s \\cdot W_{obj}^T \\text{err\\_scaled\\_obj}
                        - \\pi_l \\cdot \\text{err\\_lat}
                        - \\pi_{td} \\cdot \\text{err\\_td}
                        - \\pi_t \\cdot \\text{err\\_time}
                        - \\alpha \\cdot x_{obj}
-            dx_{loc} = - \\pi_s \\cdot W_{loc}^T (\\text{err\\_scaled} \\ast p_{obj})
+            dx_{loc} = - \\pi_s \\cdot W_{loc}^T \\text{err\\_scaled\\_loc}
                        - \\alpha \\cdot x_{loc}
 
         When ``freeze_obj=True``, only x_loc updates.
@@ -411,11 +428,13 @@ class CorticalColumn(nn.Module):
             top_down_prior: (batch, obj_dim) — expected x_obj from a
                 higher-level column.  If None, no top-down pressure.
         """
-        # Dendritic gating: separate pathways, then multiply.
-        pred_obj = self.x_obj @ self.W_obj.t()     # (B, sensory_dim)
-        pred_loc = self.x_loc @ self.W_loc.t()     # (B, sensory_dim)
-        composite = pred_obj * pred_loc             # element-wise gating
-        prediction = self.activation_fn(composite)
+        # Pre-multiplication activation: activate each pathway independently,
+        # then multiply.  Keeps both streams bounded, avoiding the dead zone.
+        z_obj = self.x_obj @ self.W_obj.t()        # (B, sensory_dim)
+        z_loc = self.x_loc @ self.W_loc.t()        # (B, sensory_dim)
+        pred_obj = self.activation_fn(z_obj)        # bounded (e.g. [-1, 1])
+        pred_loc = self.activation_fn(z_loc)        # bounded (e.g. [-1, 1])
+        prediction = pred_obj * pred_loc            # element-wise gating
 
         # Convention B (standard FEP): ε = prediction - input.
         # With this convention, grad_obj = ∇F (positive gradient of F),
@@ -423,21 +442,27 @@ class CorticalColumn(nn.Module):
         self.error = prediction - sensory_input
 
         # Cache intermediates for learn().
+        self._z_obj = z_obj
+        self._z_loc = z_loc
         self._pred_obj = pred_obj
         self._pred_loc = pred_loc
         self._prediction = prediction
-        self._composite = composite
 
-        # Chain rule through activation derivative.
-        deriv = self.activation_deriv(composite)    # (B, sensory_dim)
-        err_scaled = self.error * deriv             # (B, sensory_dim)
+        # Product-rule chain rule with two independent derivatives:
+        #   prediction = f(z_obj) * f(z_loc)
+        #   d(prediction)/d(z_obj) = f'(z_obj) * f(z_loc) = deriv_obj * pred_loc
+        #   d(prediction)/d(z_loc) = f(z_obj) * f'(z_loc) = pred_obj * deriv_loc
+        deriv_obj = self.activation_deriv(z_obj)    # (B, sensory_dim)
+        deriv_loc = self.activation_deriv(z_loc)    # (B, sensory_dim)
+        err_scaled_obj = self.error * pred_loc * deriv_obj  # (B, sensory_dim)
+        err_scaled_loc = self.error * pred_obj * deriv_loc  # (B, sensory_dim)
 
         # Dual-state update: gradient descent on F.
         # Because ε = p - s, grad_obj is ∇F_obj. All terms subtract.
         # Precision-weighted errors and Gaussian prior state decay (Phase 4.6).
         if not freeze_obj:
-            # Bottom-up sensory gradient — gated by pred_loc, weighted by pi_sensory.
-            grad_obj = (err_scaled * pred_loc) @ self.W_obj   # (B, obj_dim)
+            # Bottom-up sensory gradient — object pathway.
+            grad_obj = err_scaled_obj @ self.W_obj  # (B, obj_dim)
             dx_obj = -(self.pi_sensory * grad_obj)
 
             # Lateral consensus pressure (Phase 2).
@@ -473,8 +498,8 @@ class CorticalColumn(nn.Module):
 
             self.x_obj = self.x_obj + eta_x * dx_obj
 
-        # Location pathway — gated by pred_obj, with state decay.
-        grad_loc = (err_scaled * pred_obj) @ self.W_loc   # (B, loc_dim)
+        # Location pathway — with state decay.
+        grad_loc = err_scaled_loc @ self.W_loc     # (B, loc_dim)
         dx_loc = -(self.pi_sensory * grad_loc) - self.alpha * self.x_loc
         self.x_loc = self.x_loc + eta_x * dx_loc
 
@@ -549,9 +574,10 @@ class CorticalColumn(nn.Module):
         W -= η · ∇F = W += η · dW  (addition, unchanged).
 
         .. math::
-            \\text{err\\_scaled} = \\epsilon \\cdot \\text{activation\\_deriv}(\\text{composite})
-            W_{obj} -= \\eta_w \\cdot (\\pi_s \\cdot \\text{err\\_scaled} \\ast p_{loc})^T \\cdot x_{obj}
-            W_{loc} -= \\eta_w \\cdot (\\pi_s \\cdot \\text{err\\_scaled} \\ast p_{obj})^T \\cdot x_{loc}
+            \\text{err\\_scaled\\_obj} = \\epsilon \\cdot p_{loc} \\cdot f'(z_{obj})
+            \\text{err\\_scaled\\_loc} = \\epsilon \\cdot p_{obj} \\cdot f'(z_{loc})
+            W_{obj} -= \\eta_w \\cdot (\\pi_s \\cdot \\text{err\\_scaled\\_obj})^T \\cdot x_{obj}
+            W_{loc} -= \\eta_w \\cdot (\\pi_s \\cdot \\text{err\\_scaled\\_loc})^T \\cdot x_{loc}
             W_{lat} += \\eta_w \\cdot (\\pi_l \\cdot \\text{err\\_lat})^T \\cdot \\bar{x}_{obj}^{\\text{nbr}}
             W_{trans} += \\eta_w \\cdot (\\pi_t \\cdot \\text{err\\_time\\_scaled})^T \\cdot x_{obj\\_prev}
 
@@ -573,15 +599,21 @@ class CorticalColumn(nn.Module):
 
         batch_size = self.error.shape[0]
 
-        # Gated error: error scaled by activation derivative (generic registry).
-        err_scaled = self.error * self.activation_deriv(self._composite)
+        # Product-rule chain rule with two independent derivatives:
+        #   prediction = f(z_obj) * f(z_loc)
+        #   err_scaled_obj = error * f(z_loc) * f'(z_obj) = error * pred_loc * deriv_obj
+        #   err_scaled_loc = error * f(z_obj) * f'(z_loc) = error * pred_obj * deriv_loc
+        deriv_obj = self.activation_deriv(self._z_obj)
+        deriv_loc = self.activation_deriv(self._z_loc)
+        err_scaled_obj = self.error * self._pred_loc * deriv_obj
+        err_scaled_loc = self.error * self._pred_obj * deriv_loc
 
-        # dW_obj: ∇_W F for generative object weights, gated by pred_loc.
+        # dW_obj: ∇_W F for generative object weights.
         # Precision-scaled: π_s weights the sensory error contribution.
         # (sensory_dim, B) @ (B, obj_dim) -> (sensory_dim, obj_dim)
-        dW_obj = ((self.pi_sensory * err_scaled * self._pred_loc).t() @ self.x_obj) / batch_size
-        # dW_loc: ∇_W F for generative location weights, gated by pred_obj.
-        dW_loc = ((self.pi_sensory * err_scaled * self._pred_obj).t() @ self.x_loc) / batch_size
+        dW_obj = ((self.pi_sensory * err_scaled_obj).t() @ self.x_obj) / batch_size
+        # dW_loc: ∇_W F for generative location weights.
+        dW_loc = ((self.pi_sensory * err_scaled_loc).t() @ self.x_loc) / batch_size
 
         # Gradient descent: W -= η · ∇F  (Convention B).
         self.W_obj.data -= eta_w * dW_obj
