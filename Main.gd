@@ -16,6 +16,12 @@
 ##   Wood  (3 ≤ x < 7): warm brown  rgb(101, 67, 33)
 ##   Ice   (x ≥ 7):    pale cyan    rgb(175, 238, 238)
 ##
+## Background inference (Phase 11):
+##   A Timer fires every 0.5 s → POST /tick.
+##   Server applies thermal dissipation, ambient entropy, continuous
+##   inference (healing), then resolves cascades.
+##   Uses a dedicated HTTPRequest so ticks don't block player actions.
+##
 ## Heat overlay: hot cells blend toward fiery orange rgb(255, 76, 0).
 ## Left-click = strike (density).  Right-click / Shift+click = heat.
 
@@ -39,6 +45,11 @@ var materials: Array = []           # "stone", "wood", or "ice" per cell
 var http_request: HTTPRequest
 var request_pending: bool = false   # guard against overlapping requests
 
+# Tick metronome (Phase 11)
+var tick_http_request: HTTPRequest
+var tick_request_pending: bool = false
+var tick_timer: Timer
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -59,10 +70,22 @@ func _ready() -> void:
 			add_child(block)
 			blocks.append(block)
 
-	# --- Networking ---
+	# --- Networking (player actions) ---
 	http_request = HTTPRequest.new()
 	add_child(http_request)
 	http_request.request_completed.connect(_on_request_completed)
+
+	# --- Networking (tick metronome — Phase 11) ---
+	tick_http_request = HTTPRequest.new()
+	add_child(tick_http_request)
+	tick_http_request.request_completed.connect(_on_tick_request_completed)
+
+	# --- Tick timer — 0.5 s (2 ticks/sec), autostart ---
+	tick_timer = Timer.new()
+	tick_timer.wait_time = 0.5
+	tick_timer.autostart = true
+	add_child(tick_timer)
+	tick_timer.timeout.connect(_on_tick_timeout)
 
 	# Fetch the initial world state from the server.
 	request_pending = true
@@ -86,7 +109,7 @@ func _input(event: InputEvent) -> void:
 				strike_block(grid_x, grid_y)
 
 # ---------------------------------------------------------------------------
-# Networking
+# Networking — player actions
 # ---------------------------------------------------------------------------
 
 func heat_block(x: int, y: int) -> void:
@@ -149,6 +172,43 @@ func _on_request_completed(
 	else:
 		var state: Array = json.data
 		update_grid(state)
+
+# ---------------------------------------------------------------------------
+# Networking — tick metronome (Phase 11)
+# ---------------------------------------------------------------------------
+
+func _on_tick_timeout() -> void:
+	if tick_request_pending:
+		return                          # previous tick still in-flight
+	var headers: PackedStringArray = ["Content-Type: application/json"]
+	tick_request_pending = true
+	tick_http_request.request(
+		SERVER_URL + "/tick",
+		headers,
+		HTTPClient.METHOD_POST,
+		"{}"
+	)
+
+
+func _on_tick_request_completed(
+		result: int,
+		response_code: int,
+		_headers: PackedStringArray,
+		body: PackedByteArray
+) -> void:
+	tick_request_pending = false
+
+	if result != HTTPRequest.RESULT_SUCCESS or response_code != 200:
+		return                          # silently skip failed ticks
+
+	var json := JSON.new()
+	var err := json.parse(body.get_string_from_utf8())
+	if err != OK:
+		return
+
+	# /tick returns a flat 200-element array.
+	if json.data is Array:
+		update_grid(json.data)
 
 # ---------------------------------------------------------------------------
 # Rendering

@@ -27,6 +27,16 @@ Cross-channel coupling (Phase 10):
       Stone → no thermal reaction.
     Air dissipates heat: destroyed cells lose 0.5 thermal each resolution.
 
+Continuous background inference (Phase 11):
+    POST /tick advances the world by one time step:
+      1. Thermal dissipation: all cells cool by 0.05 (toward −1.0).
+      2. Ambient entropy: all cells weaken by 0.02 (toward −1.0).
+      3. Continuous inference: net.infer(steps=5, eta_x=0.1) — the
+         network's prediction gently heals undamaged structure.
+      4. Force destroyed cells.
+      5. Resolve cascades — slow decay may trigger new collapses.
+    The Godot client calls /tick every 0.5 s via a Timer metronome.
+
 Physics loop (on strike):
     1. Mark the cell as permanently destroyed (damage mask).
     2. Run hierarchical inference so the network "reacts" to the damage.
@@ -93,6 +103,12 @@ STRESS_SCALE: float = 0.8          # scalar applied to propagated stress
 PROPAGATION_PASSES: int = 5        # convolution passes (reach = 5 cells)
 COLLAPSE_THRESHOLD: float = 0.3    # weakened cells auto-collapse
 MAX_SETTLE_ROUNDS: int = 10        # max cascade iterations per strike
+
+# Tick — continuous background inference (Phase 11)
+TICK_THERMAL_DECAY: float = 0.05   # thermal dissipation per tick
+TICK_DENSITY_DECAY: float = 0.02   # ambient entropy per tick
+TICK_INFER_STEPS: int = 5          # inference steps for healing
+TICK_ETA_X: float = 0.1            # inference learning rate
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +627,51 @@ def heat():
     return jsonify(state_list)
 
 
+@app.route("/tick", methods=["POST"])
+def tick():
+    """Advance the world by one background time step.
+
+    Continuous environmental processes (Phase 11):
+      1. Thermal dissipation — all cells cool toward −1.0.
+      2. Ambient entropy — all cells weaken toward −1.0.
+      3. Continuous inference — the network's prediction gently heals
+         undamaged structure (steps=5, eta_x=0.1).
+      4. Force destroyed cells — permanent damage stays.
+      5. Resolve cascades — slow decay may trigger new collapses.
+
+    Called by the Godot / browser client on a 0.5 s timer.
+    Returns: flat JSON list of 200 floats (the new world state).
+    """
+    global current_world_state
+
+    with torch.no_grad():
+        # 1. Thermal dissipation: everything cools toward −1.0.
+        current_world_state[:, GRID_CELLS:] = (
+            current_world_state[:, GRID_CELLS:] - TICK_THERMAL_DECAY
+        ).clamp(-1.0, 1.0)
+
+        # 2. Ambient entropy: density drifts toward −1.0 (weathering).
+        current_world_state[:, :GRID_CELLS] = (
+            current_world_state[:, :GRID_CELLS] - TICK_DENSITY_DECAY
+        ).clamp(-1.0, 1.0)
+
+        # 3. Continuous inference: the network heals toward its prior.
+        net.infer(
+            current_world_state,
+            steps=TICK_INFER_STEPS,
+            eta_x=TICK_ETA_X,
+        )
+
+        # 4. Ensure permanent damage.
+        _force_destroyed(current_world_state)
+
+        # 5. Resolve cascades — entropy may push cells past thresholds.
+        _resolve_physics_cascades()
+
+    state_list = current_world_state.squeeze(0).cpu().tolist()
+    return jsonify(state_list)
+
+
 @app.route("/reset", methods=["POST"])
 def reset():
     """Reset the world: density → solid, thermal → cold."""
@@ -633,5 +694,6 @@ if __name__ == "__main__":
     print(f"  GET  /get_state   — fetch 200-dim state (density + thermal)")
     print(f"  POST /strike      — destroy a block   (JSON: {{x, y}})")
     print(f"  POST /heat        — heat a block      (JSON: {{x, y}})")
+    print(f"  POST /tick        — background step   (entropy + healing)")
     print(f"  POST /reset       — restore the grid\n")
     app.run(host="127.0.0.1", port=5001, debug=False)

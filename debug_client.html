@@ -17,6 +17,8 @@
   button { background: #e94560; color: white; border: none; padding: 6px 16px;
            cursor: pointer; font-family: monospace; margin-right: 8px; }
   button:hover { background: #c73650; }
+  .tick-active { color: #4ecdc4; }
+  .tick-paused { color: #e94560; }
 </style>
 </head>
 <body>
@@ -28,16 +30,24 @@
   Heats: <span id="heats">0</span> |
   Destroyed: <span id="destroyed">0</span> |
   Weakened: <span id="weakened">0</span> |
-  Hot (&gt; −0.8): <span id="hot">0</span>
+  Hot (&gt; −0.8): <span id="hot">0</span> |
+  Ticks: <span id="ticks">0</span>
 </p>
 <button onclick="resetGrid()">Reset</button>
+<button id="tickToggle" onclick="toggleTick()">Pause Tick</button>
+<span id="tickStatus" class="tick-active">⏱ ticking (0.5 s)</span>
 <div id="log"></div>
 
 <script>
 const W = 10, H = 10, URL = "http://127.0.0.1:5001";
-let strikes = 0, heats = 0, busy = false, destroyedSet = new Set();
+let strikes = 0, heats = 0, ticks = 0, busy = false, tickBusy = false;
+let destroyedSet = new Set();
 let materials = [];  // "stone", "wood", or "ice" per cell, fetched once
 const GRID_CELLS = W * H;  // 100
+
+// Tick metronome (Phase 11)
+let tickInterval = null;
+let tickPaused = false;
 
 const grid = document.getElementById("grid");
 const cells = [];
@@ -166,21 +176,64 @@ async function doHeat(x, y) {
   busy = false;
 }
 
+// --- Tick metronome (Phase 11) ---
+
+async function doTick() {
+  if (tickBusy) return;   // previous tick still in-flight
+  tickBusy = true;
+  try {
+    const r = await fetch(URL + "/tick", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: "{}"
+    });
+    const state = await r.json();
+    ticks++;
+    document.getElementById("ticks").textContent = ticks;
+    updateGrid(state);
+  } catch(e) { /* silently skip failed ticks */ }
+  tickBusy = false;
+}
+
+function startTick() {
+  if (tickInterval) return;
+  tickInterval = setInterval(doTick, 500);  // 2 ticks/sec
+  tickPaused = false;
+  document.getElementById("tickToggle").textContent = "Pause Tick";
+  document.getElementById("tickStatus").textContent = "⏱ ticking (0.5 s)";
+  document.getElementById("tickStatus").className = "tick-active";
+}
+
+function stopTick() {
+  if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+  tickPaused = true;
+  document.getElementById("tickToggle").textContent = "Resume Tick";
+  document.getElementById("tickStatus").textContent = "⏸ paused";
+  document.getElementById("tickStatus").className = "tick-paused";
+}
+
+function toggleTick() {
+  if (tickPaused) startTick(); else stopTick();
+}
+
 async function resetGrid() {
   try {
     const r = await fetch(URL + "/reset", {method: "POST"});
     const state = await r.json();
     strikes = 0;
     heats = 0;
+    ticks = 0;
     destroyedSet.clear();
     document.getElementById("strikes").textContent = 0;
     document.getElementById("heats").textContent = 0;
+    document.getElementById("ticks").textContent = 0;
     updateGrid(state);
     log("--- RESET ---");
   } catch(e) { log("ERROR: " + e.message); }
 }
 
 fetchState();
+startTick();   // begin background ticking
 </script>
 </body>
 </html>
