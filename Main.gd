@@ -2,9 +2,9 @@
 ##
 ## Attach this script to a Node2D in your scene.
 ##
-## Renders a 10×10 destructible grid.  Left-click a block to strike
-## (destroy) it.  The Python server resolves the physics via free-energy
-## minimization and returns the new world state.
+## Renders a 10×10 destructible grid with procedural textures.
+## Left-click = strike (destroy).  Right-click / Shift+click = heat.
+## The Python server resolves physics via free-energy minimization.
 ##
 ## Dual-state (Phase 9):
 ##   State tensor is 200-dim: [density×100, thermal×100].
@@ -12,9 +12,9 @@
 ##   Thermal: −1.0 = cold, +1.0 = hot.
 ##
 ## Materials (Phase 10):
-##   Stone (x < 3):    dark slate   rgb(60, 65, 85)
-##   Wood  (3 ≤ x < 7): warm brown  rgb(101, 67, 33)
-##   Ice   (x ≥ 7):    pale cyan    rgb(175, 238, 238)
+##   Stone (x < 3):     Simplex noise, dark slate gray
+##   Wood  (3 ≤ x < 7): Cellular noise (vertical grain), warm brown
+##   Ice   (x ≥ 7):     Value noise, pale translucent cyan
 ##
 ## Background inference (Phase 11):
 ##   A Timer fires every 0.5 s → POST /tick.
@@ -22,8 +22,11 @@
 ##   inference (healing), then resolves cascades.
 ##   Uses a dedicated HTTPRequest so ticks don't block player actions.
 ##
-## Heat overlay: hot cells blend toward fiery orange rgb(255, 76, 0).
-## Left-click = strike (density).  Right-click / Shift+click = heat.
+## Procedural textures (Phase 12):
+##   All material textures generated synchronously in _ready() using
+##   FastNoiseLite + Image + ImageTexture (no async await needed).
+##   Heat overlay: radial GradientTexture2D with additive blending.
+##   Heat sprites pulse subtly via _process() for fire animation.
 
 extends Node2D
 
@@ -40,7 +43,7 @@ const SERVER_URL: String = "http://127.0.0.1:5001"
 # State
 # ---------------------------------------------------------------------------
 
-var blocks: Array[ColorRect] = []
+var blocks: Array = []              # Array of { "base": Sprite2D, "heat": Sprite2D }
 var materials: Array = []           # "stone", "wood", or "ice" per cell
 var http_request: HTTPRequest
 var request_pending: bool = false   # guard against overlapping requests
@@ -50,25 +53,150 @@ var tick_http_request: HTTPRequest
 var tick_request_pending: bool = false
 var tick_timer: Timer
 
+# Procedural textures (Phase 12)
+var tex_stone: ImageTexture
+var tex_wood: ImageTexture
+var tex_ice: ImageTexture
+var tex_heat: GradientTexture2D
+
+
+# ---------------------------------------------------------------------------
+# Procedural texture generation (Phase 12)
+# ---------------------------------------------------------------------------
+
+func _generate_stone_texture() -> ImageTexture:
+	# Simplex noise → dark slate gray shades (40×40).
+	var noise := FastNoiseLite.new()
+	noise.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	noise.frequency = 0.05
+	noise.seed = randi()
+	noise.fractal_type = FastNoiseLite.FRACTAL_FBM
+	noise.fractal_octaves = 3
+
+	var img := Image.create(40, 40, false, Image.FORMAT_RGBA8)
+	for y in range(40):
+		for x in range(40):
+			var val: float = (noise.get_noise_2d(float(x), float(y)) + 1.0) / 2.0
+			# Dark slate: base rgb(55, 60, 80) with ±25 variation.
+			var r: float = (55.0 + val * 50.0) / 255.0
+			var g: float = (60.0 + val * 45.0) / 255.0
+			var b: float = (80.0 + val * 50.0) / 255.0
+			img.set_pixel(x, y, Color(r, g, b, 1.0))
+
+	return ImageTexture.create_from_image(img)
+
+
+func _generate_wood_texture() -> ImageTexture:
+	# Cellular noise, vertically stretched → warm brown wood grain (40×40).
+	var noise := FastNoiseLite.new()
+	noise.noise_type = FastNoiseLite.TYPE_CELLULAR
+	noise.frequency = 0.08
+	noise.seed = randi()
+	noise.cellular_return_type = FastNoiseLite.RETURN_DISTANCE
+
+	var img := Image.create(40, 40, false, Image.FORMAT_RGBA8)
+	for y in range(40):
+		for x in range(40):
+			# Y × 0.3 stretches noise vertically → tall thin cells = grain.
+			var val: float = (noise.get_noise_2d(float(x), float(y) * 0.3) + 1.0) / 2.0
+			# Warm brown: base rgb(80, 50, 25) with grain variation.
+			var r: float = (80.0 + val * 65.0) / 255.0
+			var g: float = (50.0 + val * 45.0) / 255.0
+			var b: float = (25.0 + val * 30.0) / 255.0
+			img.set_pixel(x, y, Color(r, g, b, 1.0))
+
+	return ImageTexture.create_from_image(img)
+
+
+func _generate_ice_texture() -> ImageTexture:
+	# Value noise → pale translucent cyan/white (40×40).
+	var noise := FastNoiseLite.new()
+	noise.noise_type = FastNoiseLite.TYPE_VALUE
+	noise.frequency = 0.06
+	noise.seed = randi()
+
+	var img := Image.create(40, 40, false, Image.FORMAT_RGBA8)
+	for y in range(40):
+		for x in range(40):
+			var val: float = (noise.get_noise_2d(float(x), float(y)) + 1.0) / 2.0
+			# Pale cyan/white: base rgb(175, 235, 240) with shimmer.
+			var r: float = (175.0 + val * 60.0) / 255.0
+			var g: float = (235.0 + val * 20.0) / 255.0
+			var b: float = (240.0 + val * 15.0) / 255.0
+			img.set_pixel(x, y, Color(r, g, b, 1.0))
+
+	return ImageTexture.create_from_image(img)
+
+
+func _generate_heat_texture() -> GradientTexture2D:
+	# Radial gradient: bright yellow center → fiery orange → transparent (60×60).
+	var grad := Gradient.new()
+	grad.colors = PackedColorArray([
+		Color(1.0, 0.95, 0.4, 1.0),    # bright yellow-white center
+		Color(1.0, 0.45, 0.0, 0.8),    # fiery orange ring
+		Color(0.6, 0.1, 0.0, 0.3),     # dark ember
+		Color(0.0, 0.0, 0.0, 0.0),     # transparent black edge
+	])
+	grad.offsets = PackedFloat32Array([0.0, 0.25, 0.6, 1.0])
+
+	var tex := GradientTexture2D.new()
+	tex.width = 60
+	tex.height = 60
+	tex.fill = GradientTexture2D.FILL_RADIAL
+	tex.fill_from = Vector2(0.5, 0.5)   # center
+	tex.fill_to = Vector2(1.0, 0.5)     # radius = half width
+	tex.gradient = grad
+
+	return tex
+
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 
 func _ready() -> void:
-	# --- Build the visual grid ---
+	# --- Sky background (visible through destroyed/transparent cells) ---
+	var sky := ColorRect.new()
+	sky.size = Vector2(GRID_W * BLOCK_SIZE, GRID_H * BLOCK_SIZE)
+	sky.color = Color(0.53, 0.78, 0.92, 1.0)    # rgb(135, 200, 235) sky blue
+	add_child(sky)
+
+	# --- Generate procedural textures ---
+	tex_stone = _generate_stone_texture()
+	tex_wood  = _generate_wood_texture()
+	tex_ice   = _generate_ice_texture()
+	tex_heat  = _generate_heat_texture()
+
+	# --- Build the node grid ---
 	for y in range(GRID_H):
 		for x in range(GRID_W):
-			var block := ColorRect.new()
-			block.size = Vector2(38, 38)                         # 2 px gap
-			block.position = Vector2(x * BLOCK_SIZE + 1, y * BLOCK_SIZE + 1)
+			var container := Node2D.new()
+			container.position = Vector2(x * BLOCK_SIZE, y * BLOCK_SIZE)
+			add_child(container)
+
+			# Base material sprite (40×40, top-left aligned).
+			var base_sprite := Sprite2D.new()
+			base_sprite.centered = false
 			if x < 3:
-				block.color = Color(60.0/255, 65.0/255, 85.0/255)    # stone = dark slate
+				base_sprite.texture = tex_stone
 			elif x < 7:
-				block.color = Color(101.0/255, 67.0/255, 33.0/255)   # wood = warm brown
+				base_sprite.texture = tex_wood
 			else:
-				block.color = Color(175.0/255, 238.0/255, 238.0/255) # ice = pale cyan
-			add_child(block)
-			blocks.append(block)
+				base_sprite.texture = tex_ice
+			container.add_child(base_sprite)
+
+			# Heat overlay sprite (60×60, centered on cell, additive).
+			var heat_sprite := Sprite2D.new()
+			heat_sprite.texture = tex_heat
+			heat_sprite.centered = true
+			heat_sprite.position = Vector2(BLOCK_SIZE / 2.0, BLOCK_SIZE / 2.0)
+			var heat_mat := CanvasItemMaterial.new()
+			heat_mat.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
+			heat_sprite.material = heat_mat
+			heat_sprite.modulate = Color(1, 1, 1, 0)    # invisible initially
+			container.add_child(heat_sprite)
+
+			blocks.append({ "base": base_sprite, "heat": heat_sprite })
 
 	# --- Networking (player actions) ---
 	http_request = HTTPRequest.new()
@@ -90,6 +218,22 @@ func _ready() -> void:
 	# Fetch the initial world state from the server.
 	request_pending = true
 	http_request.request(SERVER_URL + "/get_state")
+
+
+# ---------------------------------------------------------------------------
+# Animation — heat pulse (Phase 12)
+# ---------------------------------------------------------------------------
+
+func _process(_delta: float) -> void:
+	var time: float = Time.get_ticks_msec() / 1000.0
+	for i in range(blocks.size()):
+		var heat: Sprite2D = blocks[i]["heat"]
+		if heat.modulate.a > 0.01:
+			# Subtle pulsing scale so the fire looks alive.
+			# Per-cell phase offset (i * 0.7) prevents uniform pulsing.
+			var pulse: float = 1.0 + 0.15 * sin(time * 6.0 + float(i) * 0.7)
+			heat.scale = Vector2(pulse, pulse)
+
 
 # ---------------------------------------------------------------------------
 # Input
@@ -211,7 +355,7 @@ func _on_tick_request_completed(
 		update_grid(json.data)
 
 # ---------------------------------------------------------------------------
-# Rendering
+# Rendering (Phase 12 — procedural textures)
 # ---------------------------------------------------------------------------
 
 func update_grid(state: Array) -> void:
@@ -228,8 +372,6 @@ func update_grid(state: Array) -> void:
 		if i + grid_cells < state.size():
 			heat_val = clampf(float(state[i + grid_cells]), -1.0, 1.0)
 
-		var t: float = (1.0 - density_val) / 2.0   # 0 = solid, 1 = air
-
 		# Determine material for this cell.
 		var mat: String = "stone"
 		if i < materials.size():
@@ -244,35 +386,42 @@ func update_grid(state: Array) -> void:
 			else:
 				mat = "ice"
 
-		var r: float
-		var g: float
-		var b: float
+		var base: Sprite2D = blocks[i]["base"]
+		var heat: Sprite2D = blocks[i]["heat"]
 
-		if t > 0.9:
-			# Air / destroyed — sky blue
-			r = 135.0; g = 200.0; b = 235.0
-		elif mat == "stone":
-			# Stone: dark slate → light gray-blue
-			r = 60.0 + t * 120.0
-			g = 65.0 + t * 120.0
-			b = 85.0 + t * 130.0
+		# --- Material texture swap ---
+		if mat == "stone":
+			base.texture = tex_stone
 		elif mat == "wood":
-			# Wood: warm brown → lighter brown
-			r = 101.0 + t * 100.0
-			g = 67.0 + t * 100.0
-			b = 33.0 + t * 80.0
+			base.texture = tex_wood
 		else:
-			# Ice: pale cyan → white
-			r = 175.0 + t * 75.0
-			g = 238.0 + t * 12.0
-			b = 238.0 + t * 12.0
+			base.texture = tex_ice
 
-		# Heat overlay: blend toward fiery orange (255, 76, 0).
-		if heat_val > -0.8:
-			var heat_t: float = (heat_val + 1.0) / 2.0   # 0 = cold, 1 = hot
-			var blend: float = heat_t * 0.8               # max 80% blend
-			r = r * (1.0 - blend) + 255.0 * blend
-			g = g * (1.0 - blend) + 76.0 * blend
-			b = b * (1.0 - blend) + 0.0 * blend
+		# --- Structural damage (density → opacity + darkening) ---
+		if density_val <= -0.9:
+			# Air / destroyed — fully transparent, sky shows through.
+			base.modulate = Color(1, 1, 1, 0)
+		elif density_val >= 0.95:
+			# Full health — pristine, no tint.
+			base.modulate = Color(1, 1, 1, 1)
+		else:
+			# Damaged: map density [-0.9 .. 0.95] → [0 .. 1].
+			var health: float = (density_val + 0.9) / 1.85
+			health = clampf(health, 0.0, 1.0)
+			# Alpha fades as structure crumbles.
+			var alpha: float = 0.15 + health * 0.85
+			# RGB darkens to simulate cracking / weakening.
+			var darken: float = 0.4 + health * 0.6
+			base.modulate = Color(darken, darken, darken, alpha)
 
-		blocks[i].color = Color(r / 255.0, g / 255.0, b / 255.0)
+		# --- Thermodynamics (heat → overlay opacity) ---
+		if heat_val < -0.8:
+			# Cold — heat overlay invisible.
+			heat.modulate = Color(1, 1, 1, 0)
+			heat.scale = Vector2(1.0, 1.0)
+		else:
+			# Map [-0.8 .. 1.0] → [0.0 .. 1.0] for smooth fade-in.
+			var heat_t: float = (heat_val + 0.8) / 1.8
+			heat_t = clampf(heat_t, 0.0, 1.0)
+			heat.modulate = Color(1, 1, 1, heat_t)
+			# Scale pulse is handled by _process() for smooth 60fps animation.
