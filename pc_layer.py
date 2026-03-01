@@ -1,5 +1,5 @@
 """
-Cortical Column — Phase 4: Temporal Predictive Coding
+Cortical Column — Phase 4.6: Precision Weighting + State Decay
 
 A biologically-structured cortical column implementing the Thousand Brains
 theory.  Each CorticalColumn natively separates object identity ("What" /
@@ -8,32 +8,44 @@ L2/3), sensor location ("Where" / L6), and motor output ("Action" / L5).
 Phase 2 adds **lateral connections** (W_lat) between neighbouring columns.
 Phase 3 adds **top-down priors** from a higher-level column, enabling
 hierarchical attention.
-Phase 4 adds **temporal prediction** (W_trans) — the column remembers its
-previous belief (x_obj_prev) and learns a transition matrix that predicts
-how beliefs evolve over time.  This enables the network to learn simple
-physics (kinematics) and "dream" future states with zero sensory input.
+Phase 4 adds **temporal prediction** (W_trans) with memory (x_obj_prev).
+Phase 4.5 upgrades to **dendritic gating** (multiplicative interaction)
+and **non-linear temporal transitions**, with overcomplete latent spaces.
+Phase 4.6 adds **precision weighting** (Π scalars) for each error modality
+and a **Gaussian prior** (state decay) on latent variables.
 
 Mathematical foundation (Free Energy Principle):
-    - L2/3 generative prediction (composite):
-          prediction = activation(W_obj @ x_obj + W_loc @ x_loc)
+    - L2/3 generative prediction (dendritic gating):
+          pred_obj = W_obj @ x_obj
+          pred_loc = W_loc @ x_loc
+          prediction = tanh(pred_obj * pred_loc)   # element-wise multiply
     - L4 sensory error:
           err_sensory = sensory_input - prediction
+    - Scaled error (chain rule through tanh):
+          err_scaled = err_sensory * (1 - prediction^2)
     - Lateral consensus error (Phase 2):
           err_lat = x_obj - W_lat @ neighbor_context
     - Top-down attention error (Phase 3):
           err_td = x_obj - top_down_prior
-    - Temporal prediction error (Phase 4):
-          err_time = x_obj - W_trans @ x_obj_prev
-    - Internal ODE settling (dual state + lateral + top-down + temporal):
-          dx_obj = (W_obj.T @ err_sensory_grad) - err_lat - err_td - err_time
-          dx_loc = W_loc.T @ err_sensory_grad
+    - Temporal prediction error (Phase 4, non-linear):
+          err_time = x_obj - tanh(W_trans @ x_obj_prev)
+    - Internal ODE settling (precision-weighted, with state decay):
+          dx_obj = π_s * W_obj.T @ (err_scaled * pred_loc)
+                 - π_l * err_lat - π_td * err_td - π_t * err_time
+                 - α * x_obj
+          dx_loc = π_s * W_loc.T @ (err_scaled * pred_obj) - α * x_loc
     - L5 motor action (Active Inference):
           action = -eta_a * (sensory_gradient.T @ error)
-    - Hebbian learning:
-          dW_obj = eta_w * (err_sensory @ x_obj.T)
-          dW_loc = eta_w * (err_sensory @ x_loc.T)
-          dW_lat = eta_w * (err_lat @ neighbor_context.T)
-          dW_trans = eta_w * (err_time @ x_obj_prev.T)
+    - Variational Free Energy (precision-weighted):
+          F = ½ π_s ||err_sensory||² + ½ π_l ||err_lat||²
+            + ½ π_td ||err_td||² + ½ π_t ||err_time||²
+            + ½ α (||x_obj||² + ||x_loc||²)
+    - Hebbian learning (gated):
+          dW_obj   = eta_w * ((err_scaled * pred_loc).T @ x_obj)
+          dW_loc   = eta_w * ((err_scaled * pred_obj).T @ x_loc)
+          dW_lat   = eta_w * (err_lat.T @ neighbor_context)
+          dW_trans = eta_w * (err_time_scaled.T @ x_obj_prev)
+            where err_time_scaled = err_time * (1 - temporal_pred^2)
 
 No autograd. No backpropagation. All dynamics are local ODEs
 minimising Free Energy (prediction error).
@@ -113,7 +125,7 @@ _ACTIVATION_REGISTRY: dict[str, Callable[[], tuple[Callable, Callable]]] = {
 class CorticalColumn(nn.Module):
     """A single Cortical Column with separated What/Where/Action streams,
     lateral connections for inter-column consensus, top-down hierarchical
-    attention, and temporal prediction.
+    attention, temporal prediction, and dendritic gating.
 
     Implements the Thousand Brains theory at the single-column level.
     Internally maintains two latent state vectors and four weight
@@ -131,31 +143,31 @@ class CorticalColumn(nn.Module):
     Temporal memory (persists across observations within a sequence):
         x_obj_prev : (batch, obj_dim)    — previous x_obj (set by step_time()).
 
+    Cached intermediates (set by infer_step, consumed by learn):
+        _pred_obj      : (batch, sensory_dim) — object pathway pre-gate.
+        _pred_loc      : (batch, sensory_dim) — location pathway pre-gate.
+        _prediction    : (batch, sensory_dim) — tanh(pred_obj * pred_loc).
+        _temporal_pred : (batch, obj_dim)     — tanh(W_trans @ x_obj_prev).
+
     Parameters (slow dynamics — Hebbian learning):
         W_obj   : (sensory_dim, obj_dim) — generative weights for object.
         W_loc   : (sensory_dim, loc_dim) — generative weights for location.
-        W_lat   : (obj_dim, obj_dim)     — lateral weights mapping neighbour
-                  context to predicted local x_obj (Phase 2).
-        W_trans : (obj_dim, obj_dim)     — temporal transition matrix mapping
-                  previous belief to predicted current belief (Phase 4).
+        W_lat   : (obj_dim, obj_dim)     — lateral weights (Phase 2).
+        W_trans : (obj_dim, obj_dim)     — temporal transition matrix (Phase 4).
 
-    The composite generative prediction sent from L2/3 down to L4:
-        prediction = activation(W_obj @ x_obj + W_loc @ x_loc)
+    Dendritic gating (Phase 4.5) — multiplicative prediction:
+        pred_obj = W_obj @ x_obj
+        pred_loc = W_loc @ x_loc
+        prediction = tanh(pred_obj * pred_loc)   # element-wise multiply
 
-    Lateral consensus (Phase 2):
-        err_lat = x_obj - W_lat @ neighbor_context
-        dx_obj += -err_lat   (pulls toward neighbour agreement)
+    The product rule gives gated gradients:
+        dx_obj = W_obj.T @ (err_scaled * pred_loc) - err_lat - err_td - err_time
+        dx_loc = W_loc.T @ (err_scaled * pred_obj)
+      where err_scaled = error * (1 - prediction^2)
 
-    Top-down attention (Phase 3):
-        err_td = x_obj - top_down_prior
-        dx_obj += -err_td    (pulls toward higher-level expectation)
-
-    Temporal prediction (Phase 4):
-        err_time = x_obj - W_trans @ x_obj_prev
-        dx_obj += -err_time  (pulls toward temporally predicted state)
-
-    L5 motor output computes Active Inference action commands from
-    the spatial gradient of sensory input and the L4 error.
+    Non-linear temporal (Phase 4.5):
+        temporal_pred = tanh(W_trans @ x_obj_prev)
+        err_time = x_obj - temporal_pred
 
     Args:
         obj_dim:     Dimensionality of the "What" state (L2/3).
@@ -175,6 +187,10 @@ class CorticalColumn(nn.Module):
     err_td: Optional[Tensor]
     err_time: Optional[Tensor]
     x_obj_prev: Optional[Tensor]
+    _pred_obj: Optional[Tensor]
+    _pred_loc: Optional[Tensor]
+    _prediction: Optional[Tensor]
+    _temporal_pred: Optional[Tensor]
 
     def __init__(
         self,
@@ -236,6 +252,26 @@ class CorticalColumn(nn.Module):
         # --- Temporal memory (persists across observations in a sequence) ---
         self.x_obj_prev = None    # set by step_time(), NOT zeroed by reset_states()
 
+        # --- Precision scalars (Π) — balance error modalities (Phase 4.6) ---
+        # In FEP, each error term is weighted by the inverse variance
+        # (precision) of the corresponding generative model component.
+        # Higher precision = more trusted signal.
+        self.pi_sensory = 1.0   # direct sensory — highest precision
+        self.pi_lat = 0.5       # lateral consensus — slightly less precise
+        self.pi_td = 0.5        # top-down attention — slightly less precise
+        self.pi_time = 0.8      # temporal prediction — fairly precise
+
+        # State decay constant (Gaussian prior on latent states).
+        # In FEP, x has a standard normal prior N(0, 1/alpha), introducing
+        # a -alpha * x term to the ODE that prevents runaway activations.
+        self.alpha = 0.05
+
+        # --- Phase 4.5: cached intermediates for gated gradients ---
+        self._pred_obj = None      # x_obj @ W_obj.T  (cached for learn)
+        self._pred_loc = None      # x_loc @ W_loc.T  (cached for learn)
+        self._prediction = None    # tanh(pred_obj * pred_loc) (cached for learn)
+        self._temporal_pred = None # tanh(x_obj_prev @ W_trans.T) (cached for learn)
+
     # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
@@ -243,7 +279,11 @@ class CorticalColumn(nn.Module):
     def reset_states(
         self, batch_size: int, device: Optional[torch.device] = None,
     ) -> None:
-        """Zero-initialise all fast states for a new observation.
+        """Initialise all fast states for a new observation.
+
+        x_obj and x_loc are initialised to small random values (not zeros)
+        to bootstrap the multiplicative dendritic gate — with pure zeros,
+        pred_obj * pred_loc = 0 and all gradients vanish.
 
         Note: x_obj_prev is NOT zeroed — temporal memory persists across
         observations within a sequence.  Only step_time() or direct
@@ -256,33 +296,48 @@ class CorticalColumn(nn.Module):
         if device is None:
             device = self.W_obj.device
 
-        self.x_obj = torch.zeros(batch_size, self.obj_dim, device=device)
-        self.x_loc = torch.zeros(batch_size, self.loc_dim, device=device)
+        # Random init for dendritic gating bootstrap (Phase 4.5).
+        # Scale 0.1 provides enough gate signal for gradients to flow
+        # through the multiplicative interaction from the first step.
+        self.x_obj = 0.1 * torch.randn(batch_size, self.obj_dim, device=device)
+        self.x_loc = 0.1 * torch.randn(batch_size, self.loc_dim, device=device)
         self.error = torch.zeros(batch_size, self.sensory_dim, device=device)
         self.err_lat = torch.zeros(batch_size, self.obj_dim, device=device)
         self.err_td = torch.zeros(batch_size, self.obj_dim, device=device)
         self.err_time = torch.zeros(batch_size, self.obj_dim, device=device)
 
+        # Clear cached intermediates.
+        self._pred_obj = None
+        self._pred_loc = None
+        self._prediction = None
+        self._temporal_pred = None
+
     # ------------------------------------------------------------------
     # L2/3 → L4: Generative prediction
     # ------------------------------------------------------------------
 
-    def predict_down(self) -> Tensor:
-        """Compute the composite L2/3 generative prediction for L4.
+    def predict_down(self) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute the L2/3 generative prediction via dendritic gating.
+
+        Phase 4.5: Uses multiplicative (dendritic) gating instead of
+        additive composition.  Location gates object identity:
 
         .. math::
-            p = \\text{activation}(W_{obj} \\cdot x_{obj} + W_{loc} \\cdot x_{loc})
+            p_{obj} = x_{obj} \\cdot W_{obj}^T
+            p_{loc} = x_{loc} \\cdot W_{loc}^T
+            \\text{prediction} = \\text{activation}(p_{obj} * p_{loc})
 
         Returns:
-            prediction: (batch, sensory_dim)
+            (prediction, pred_obj, pred_loc) where:
+                prediction: (batch, sensory_dim) — gated prediction.
+                pred_obj:   (batch, sensory_dim) — object pathway pre-gate.
+                pred_loc:   (batch, sensory_dim) — location pathway pre-gate.
         """
-        # x_obj: (B, obj_dim), W_obj: (sensory_dim, obj_dim)
-        # x_loc: (B, loc_dim), W_loc: (sensory_dim, loc_dim)
-        composite = (
-            self.x_obj @ self.W_obj.t()    # (B, sensory_dim)
-            + self.x_loc @ self.W_loc.t()  # (B, sensory_dim)
-        )
-        return self.activation_fn(composite)
+        pred_obj = self.x_obj @ self.W_obj.t()    # (B, sensory_dim)
+        pred_loc = self.x_loc @ self.W_loc.t()    # (B, sensory_dim)
+        composite = pred_obj * pred_loc            # element-wise gating
+        prediction = self.activation_fn(composite)
+        return prediction, pred_obj, pred_loc
 
     # ------------------------------------------------------------------
     # L4: Sensory error
@@ -300,7 +355,7 @@ class CorticalColumn(nn.Module):
         Returns:
             error: (batch, sensory_dim)
         """
-        prediction = self.predict_down()
+        prediction, _, _ = self.predict_down()
         self.error = sensory_input - prediction
         return self.error
 
@@ -318,86 +373,95 @@ class CorticalColumn(nn.Module):
     ) -> None:
         """One Euler step of the dual-state settling ODE.
 
-        Both x_obj and x_loc evolve simultaneously to minimise the L4
-        prediction error.  The gradient flows through the activation
-        derivative to respect the nonlinearity.
+        Phase 4.5 uses **dendritic gating** (multiplicative interaction):
+        the prediction is ``tanh(pred_obj * pred_loc)`` instead of
+        ``tanh(pred_obj + pred_loc)``.  The product rule gives gated
+        gradients: each pathway's gradient is scaled by the other
+        pathway's value.
 
-        Phase 2 adds lateral consensus: when ``neighbor_context`` is
-        provided, x_obj is additionally pulled toward the lateral
-        prediction (W_lat @ neighbor_context).
-
-        Phase 3 adds top-down attention: when ``top_down_prior`` is
-        provided, x_obj is additionally pulled toward the higher-level
-        expectation, enabling hierarchical directed attention.
+        Phase 4.6 adds **precision weighting** (Π) for each error modality
+        and a **Gaussian prior** (state decay: -α·x) that prevents runaway
+        activations and ensures proper FEP free energy minimisation.
 
         .. math::
-            \\text{err\\_sensory} = \\text{input} - \\text{prediction}
-            \\text{err\\_lat} = x_{obj} - W_{lat} \\cdot \\bar{x}_{obj}^{\\text{neighbors}}
-            \\text{err\\_td} = x_{obj} - \\text{top\\_down\\_prior}
-            dx_{obj} = W_{obj}^T \\cdot \\text{err\\_grad} - \\text{err\\_lat} - \\text{err\\_td}
-            dx_{loc} = W_{loc}^T \\cdot \\text{err\\_grad}
+            dx_{obj} = \\pi_s \\cdot W_{obj}^T (\\text{err\\_scaled} \\ast p_{loc})
+                     - \\pi_l \\cdot \\text{err\\_lat}
+                     - \\pi_{td} \\cdot \\text{err\\_td}
+                     - \\pi_t \\cdot \\text{err\\_time}
+                     - \\alpha \\cdot x_{obj}
+            dx_{loc} = \\pi_s \\cdot W_{loc}^T (\\text{err\\_scaled} \\ast p_{obj})
+                     - \\alpha \\cdot x_{loc}
 
-        When ``freeze_obj=True``, only x_loc updates.  This is used
-        during sensorimotor tracking: L2/3 object identity is stable
-        across saccades while L6 location adapts to each new view.
+        When ``freeze_obj=True``, only x_loc updates.
 
         Args:
             sensory_input: (batch, sensory_dim) — observed data.
             eta_x: Step size for belief updates.
             freeze_obj: If True, hold x_obj fixed (only x_loc settles).
             neighbor_context: (batch, obj_dim) — average x_obj of spatial
-                neighbours.  If None, no lateral pressure is applied
-                (Phase 1 backward-compatible behaviour).
+                neighbours.  If None, no lateral pressure is applied.
             top_down_prior: (batch, obj_dim) — expected x_obj from a
-                higher-level column.  If None, no top-down pressure is
-                applied (Phase 1/2 backward-compatible behaviour).
+                higher-level column.  If None, no top-down pressure.
         """
-        # Recompute composite pre-activation and prediction.
-        composite = (
-            self.x_obj @ self.W_obj.t()
-            + self.x_loc @ self.W_loc.t()
-        )
+        # Dendritic gating: separate pathways, then multiply.
+        pred_obj = self.x_obj @ self.W_obj.t()     # (B, sensory_dim)
+        pred_loc = self.x_loc @ self.W_loc.t()     # (B, sensory_dim)
+        composite = pred_obj * pred_loc             # element-wise gating
         prediction = self.activation_fn(composite)
         self.error = sensory_input - prediction
 
-        # Chain rule: error gradient through activation derivative.
-        deriv = self.activation_deriv(composite)  # (B, sensory_dim)
-        error_grad = self.error * deriv           # (B, sensory_dim)
+        # Cache intermediates for learn().
+        self._pred_obj = pred_obj
+        self._pred_loc = pred_loc
+        self._prediction = prediction
 
-        # Dual-state update: both states chase the same error signal.
+        # Chain rule through activation derivative.
+        deriv = self.activation_deriv(composite)    # (B, sensory_dim)
+        err_scaled = self.error * deriv             # (B, sensory_dim)
+
+        # Dual-state update with gated gradients (product rule).
+        # Precision-weighted errors and Gaussian prior state decay (Phase 4.6).
         if not freeze_obj:
-            # Bottom-up sensory pressure.
-            dx_obj = error_grad @ self.W_obj   # (B, obj_dim)
+            # Bottom-up sensory pressure — gated by pred_loc, weighted by pi_sensory.
+            grad_obj = (err_scaled * pred_loc) @ self.W_obj   # (B, obj_dim)
+            dx_obj = self.pi_sensory * grad_obj
 
             # Lateral consensus pressure (Phase 2).
             if neighbor_context is not None:
-                # Lateral error: how far is x_obj from what neighbours predict?
                 lateral_pred = neighbor_context @ self.W_lat.t()  # (B, obj_dim)
                 self.err_lat = self.x_obj - lateral_pred
-                dx_obj = dx_obj - self.err_lat
+                dx_obj = dx_obj - self.pi_lat * self.err_lat
             else:
                 self.err_lat = torch.zeros_like(self.x_obj)
 
             # Top-down hierarchical pressure (Phase 3).
             if top_down_prior is not None:
-                # Top-down error: how far is x_obj from what the
-                # higher level expects?
                 self.err_td = self.x_obj - top_down_prior  # (B, obj_dim)
-                dx_obj = dx_obj - self.err_td
+                dx_obj = dx_obj - self.pi_td * self.err_td
             else:
                 self.err_td = torch.zeros_like(self.x_obj)
 
-            # Temporal prediction pressure (Phase 4).
+            # Temporal prediction pressure (Phase 4, non-linear).
             if self.x_obj_prev is not None:
-                temporal_pred = self.x_obj_prev @ self.W_trans.t()  # (B, obj_dim)
+                temporal_pred = torch.tanh(
+                    self.x_obj_prev @ self.W_trans.t()
+                )  # (B, obj_dim)
+                self._temporal_pred = temporal_pred
                 self.err_time = self.x_obj - temporal_pred
-                dx_obj = dx_obj - self.err_time
+                dx_obj = dx_obj - self.pi_time * self.err_time
             else:
+                self._temporal_pred = None
                 self.err_time = torch.zeros_like(self.x_obj)
+
+            # State decay — Gaussian prior N(0, 1/alpha) on x_obj.
+            # Prevents runaway activations and provides biological gain control.
+            dx_obj = dx_obj - self.alpha * self.x_obj
 
             self.x_obj = self.x_obj + eta_x * dx_obj
 
-        dx_loc = error_grad @ self.W_loc   # (B, loc_dim)
+        # Location pathway — gated by pred_obj, with state decay.
+        grad_loc = (err_scaled * pred_obj) @ self.W_loc   # (B, loc_dim)
+        dx_loc = self.pi_sensory * grad_loc - self.alpha * self.x_loc
         self.x_loc = self.x_loc + eta_x * dx_loc
 
     # ------------------------------------------------------------------
@@ -454,46 +518,61 @@ class CorticalColumn(nn.Module):
     ) -> None:
         """Hebbian update for generative, lateral, and temporal weight matrices.
 
-        Called *after* the inference loop has settled.
+        Phase 4.5: Uses gated error signals matching the chain-rule
+        derivatives from dendritic gating and non-linear temporal transitions.
 
         .. math::
-            \\Delta W_{obj}   = \\eta_w \\cdot \\epsilon^T \\cdot x_{obj}
-            \\Delta W_{loc}   = \\eta_w \\cdot \\epsilon^T \\cdot x_{loc}
+            \\text{err\\_scaled} = \\epsilon \\cdot (1 - \\text{prediction}^2)
+            \\Delta W_{obj}   = \\eta_w \\cdot (\\text{err\\_scaled} \\ast p_{loc})^T \\cdot x_{obj}
+            \\Delta W_{loc}   = \\eta_w \\cdot (\\text{err\\_scaled} \\ast p_{obj})^T \\cdot x_{loc}
             \\Delta W_{lat}   = \\eta_w \\cdot \\text{err\\_lat}^T \\cdot \\bar{x}_{obj}^{\\text{nbr}}
-            \\Delta W_{trans} = \\eta_w \\cdot \\text{err\\_time}^T \\cdot x_{obj\\_prev}
+            \\text{err\\_time\\_scaled} = \\text{err\\_time} \\cdot (1 - \\text{temporal\\_pred}^2)
+            \\Delta W_{trans} = \\eta_w \\cdot \\text{err\\_time\\_scaled}^T \\cdot x_{obj\\_prev}
 
         Averaged over the batch.
 
         Args:
             eta_w: Learning rate for weight updates.
             neighbor_context: (batch, obj_dim) — average x_obj of spatial
-                neighbours.  If provided, W_lat is updated to associate
-                this column's state with its neighbours' consensus.
+                neighbours.  If provided, W_lat is updated.
         """
         if self.error is None or self.x_obj is None:
             raise RuntimeError(
                 "States not initialised. Run inference before learn()."
             )
+        if self._prediction is None:
+            raise RuntimeError(
+                "Intermediates not cached. Run infer_step() before learn()."
+            )
 
         batch_size = self.error.shape[0]
 
-        # dW_obj: (sensory_dim, B) @ (B, obj_dim) -> (sensory_dim, obj_dim)
-        dW_obj = (self.error.t() @ self.x_obj) / batch_size
-        dW_loc = (self.error.t() @ self.x_loc) / batch_size
+        # Gated error: error scaled by activation derivative (tanh shortcut).
+        err_scaled = self.error * (1.0 - self._prediction.pow(2))
+
+        # dW_obj: gated by pred_loc (product rule).
+        # (sensory_dim, B) @ (B, obj_dim) -> (sensory_dim, obj_dim)
+        dW_obj = ((err_scaled * self._pred_loc).t() @ self.x_obj) / batch_size
+        # dW_loc: gated by pred_obj (product rule).
+        dW_loc = ((err_scaled * self._pred_obj).t() @ self.x_loc) / batch_size
 
         self.W_obj.data += eta_w * dW_obj
         self.W_loc.data += eta_w * dW_loc
 
-        # Lateral weight update (Phase 2).
+        # Lateral weight update (Phase 2) — unchanged.
         if neighbor_context is not None and self.err_lat is not None:
-            # dW_lat: (obj_dim, B) @ (B, obj_dim) -> (obj_dim, obj_dim)
             dW_lat = (self.err_lat.t() @ neighbor_context) / batch_size
             self.W_lat.data += eta_w * dW_lat
 
-        # Temporal weight update (Phase 4).
-        if self.x_obj_prev is not None and self.err_time is not None:
-            # dW_trans: (obj_dim, B) @ (B, obj_dim) -> (obj_dim, obj_dim)
-            dW_trans = (self.err_time.t() @ self.x_obj_prev) / batch_size
+        # Temporal weight update (Phase 4.5, non-linear).
+        if (self.x_obj_prev is not None
+                and self.err_time is not None
+                and self._temporal_pred is not None):
+            # Chain rule through tanh: scale err_time by tanh derivative.
+            err_time_scaled = self.err_time * (
+                1.0 - self._temporal_pred.pow(2)
+            )
+            dW_trans = (err_time_scaled.t() @ self.x_obj_prev) / batch_size
             self.W_trans.data += eta_w * dW_trans
 
     # ------------------------------------------------------------------
@@ -501,23 +580,32 @@ class CorticalColumn(nn.Module):
     # ------------------------------------------------------------------
 
     def get_energy(self) -> float:
-        """Return the current free energy (sensory + lateral + top-down + temporal).
+        """Return the precision-weighted variational free energy.
+
+        Phase 4.6: Each error term is weighted by its precision scalar,
+        and a Gaussian prior energy term penalises large latent states.
 
         .. math::
-            F = \\frac{1}{2} \\sum \\epsilon_{\\text{sensory}}^2
-              + \\frac{1}{2} \\sum \\epsilon_{\\text{lateral}}^2
-              + \\frac{1}{2} \\sum \\epsilon_{\\text{top-down}}^2
-              + \\frac{1}{2} \\sum \\epsilon_{\\text{temporal}}^2
+            F = \\frac{1}{2} \\pi_s \\sum \\epsilon_{\\text{sensory}}^2
+              + \\frac{1}{2} \\pi_l \\sum \\epsilon_{\\text{lateral}}^2
+              + \\frac{1}{2} \\pi_{td} \\sum \\epsilon_{\\text{top-down}}^2
+              + \\frac{1}{2} \\pi_t \\sum \\epsilon_{\\text{temporal}}^2
+              + \\frac{1}{2} \\alpha (\\|x_{obj}\\|^2 + \\|x_{loc}\\|^2)
         """
         e = 0.0
         if self.error is not None:
-            e += 0.5 * (self.error * self.error).sum().item()
+            e += 0.5 * self.pi_sensory * (self.error * self.error).sum().item()
         if self.err_lat is not None:
-            e += 0.5 * (self.err_lat * self.err_lat).sum().item()
+            e += 0.5 * self.pi_lat * (self.err_lat * self.err_lat).sum().item()
         if self.err_td is not None:
-            e += 0.5 * (self.err_td * self.err_td).sum().item()
+            e += 0.5 * self.pi_td * (self.err_td * self.err_td).sum().item()
         if self.err_time is not None:
-            e += 0.5 * (self.err_time * self.err_time).sum().item()
+            e += 0.5 * self.pi_time * (self.err_time * self.err_time).sum().item()
+        # Gaussian prior energy: penalise deviation from zero.
+        if self.x_obj is not None:
+            e += 0.5 * self.alpha * (self.x_obj * self.x_obj).sum().item()
+        if self.x_loc is not None:
+            e += 0.5 * self.alpha * (self.x_loc * self.x_loc).sum().item()
         return e
 
     # ------------------------------------------------------------------
@@ -553,14 +641,15 @@ if __name__ == "__main__":
     device = _get_device()
     print(f"Using device: {device}\n")
 
+    # Overcomplete: obj_dim (100) >> sensory_dim (25) — sparse dictionary.
     col = CorticalColumn(
-        obj_dim=8, loc_dim=4, sensory_dim=25, activation_fn_name="tanh",
+        obj_dim=100, loc_dim=4, sensory_dim=25, activation_fn_name="tanh",
     ).to(device)
     print(col)
 
     B = 1
     col.reset_states(B, device)
-    print(f"\n  x_obj shape: {col.x_obj.shape}  (expect [1, 8])")
+    print(f"\n  x_obj shape: {col.x_obj.shape}  (expect [1, 100])")
     print(f"  x_loc shape: {col.x_loc.shape}  (expect [1, 4])")
 
     # Fake sensory input.
@@ -683,6 +772,18 @@ if __name__ == "__main__":
     # Energy includes temporal term.
     energy_with_time = col.get_energy()
     print(f"  Energy (with temporal): {energy_with_time:.4f}  [OK]")
+
+    # Dendritic gating test (Phase 4.5).
+    print("\n  --- Phase 4.5: Dendritic gating ---")
+    col.reset_states(B, device)
+    pred, pred_obj, pred_loc = col.predict_down()
+    print(f"  predict_down returns tuple of 3  [OK]")
+    print(f"  prediction shape: {pred.shape}  (expect [1, 25])")
+    print(f"  pred_obj shape:   {pred_obj.shape}  (expect [1, 25])")
+    print(f"  pred_loc shape:   {pred_loc.shape}  (expect [1, 25])")
+    assert pred.shape == (B, 25)
+    assert pred_obj.shape == (B, 25)
+    assert pred_loc.shape == (B, 25)
 
     # No autograd.
     for name, param in col.named_parameters():

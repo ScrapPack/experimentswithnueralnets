@@ -67,7 +67,7 @@ def main() -> None:
     # 2. Instantiate the CorticalColumn
     # -----------------------------------------------------------------
     SENSORY_DIM = FOVEA_H * FOVEA_W   # 25
-    OBJ_DIM = 16                       # "What" latent size
+    OBJ_DIM = 100                      # overcomplete (4x sensory_dim)
     LOC_DIM = 8                        # "Where" latent size
 
     column = CorticalColumn(
@@ -138,20 +138,23 @@ def main() -> None:
     target_fovea = sample_fovea(TARGET_Y, TARGET_X)
     print(f"  Target fovea (centred): {target_fovea.sum().item():.0f} lit pixels")
 
+    N_TRAIN_EPOCHS = 200
+    TRAIN_SETTLE = 50
+
     with torch.no_grad():
-        for epoch in range(50):
+        for epoch in range(N_TRAIN_EPOCHS):
             column.reset_states(1, device)
-            for step in range(30):
+            for step in range(TRAIN_SETTLE):
                 column.infer_step(target_fovea, eta_x=0.1)
             column.learn(eta_w=0.01)
 
-            if epoch % 10 == 0:
+            if epoch % 40 == 0 or epoch == N_TRAIN_EPOCHS - 1:
                 e = column.get_energy()
                 print(f"  epoch {epoch:3d}  energy={e:.4f}")
 
     # Final settle — capture the trained x_obj as the persistent object prior.
     column.reset_states(1, device)
-    for step in range(30):
+    for step in range(TRAIN_SETTLE):
         column.infer_step(target_fovea, eta_x=0.1)
     final_train_energy = column.get_energy()
     trained_x_obj = column.x_obj.clone()
@@ -173,7 +176,7 @@ def main() -> None:
     # gradient field (sigma=1.5 → reliable gradient out to ~2 sigma).
     fy, fx = 3.0, 3.0
 
-    INFER_STEPS = 30
+    INFER_STEPS = 50
     ETA_X = 0.1
     ETA_A = 1.0
     N_STEPS = 80
@@ -194,7 +197,7 @@ def main() -> None:
             # representation across saccades.  Only L6 (x_loc) settles
             # to discover the new sensor location.
             column.x_obj = trained_x_obj.clone()
-            column.x_loc = torch.zeros(1, LOC_DIM, device=device)
+            column.x_loc = 0.1 * torch.randn(1, LOC_DIM, device=device)
             column.error = torch.zeros(1, SENSORY_DIM, device=device)
             for s in range(INFER_STEPS):
                 column.infer_step(fovea, eta_x=ETA_X, freeze_obj=True)

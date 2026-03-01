@@ -62,7 +62,7 @@ def main() -> None:
     # -----------------------------------------------------------------
     # 1. Build the CorticalColumn
     # -----------------------------------------------------------------
-    OBJ_DIM = 16
+    OBJ_DIM = 100   # overcomplete (4x for sensory_dim=25)
     LOC_DIM = 4
     SENSORY_DIM = 25   # 5×5 grid
 
@@ -98,7 +98,7 @@ def main() -> None:
     # -----------------------------------------------------------------
     print("Phase 1: Training on falling block sequence...")
 
-    N_EPOCHS = 200
+    N_EPOCHS = 300
     SETTLE_STEPS = 50
     ETA_X = 0.1
     ETA_W = 0.01
@@ -169,7 +169,7 @@ def main() -> None:
     print("\nPhase 2: Dreaming — generating future from memory alone")
 
     blank = torch.zeros(1, SENSORY_DIM, device=device)
-    DREAM_SETTLE = 100  # more steps for dreaming (weaker signal)
+    DREAM_SETTLE = 150  # more steps for dreaming (weaker signal)
 
     dream_x_objs: list[torch.Tensor] = []
     dream_predictions: list[torch.Tensor] = []
@@ -189,14 +189,14 @@ def main() -> None:
                 energies.append(col.get_energy())
 
             dream_x_objs.append(col.x_obj.clone())
-            dream_predictions.append(col.predict_down().clone())
+            dream_predictions.append(col.predict_down()[0].clone())
 
             print(f"\n  Dream {dream_idx + 1} (from Frame {dream_idx} memory):")
             print(f"    Energy: {energies[0]:.4f} → {energies[-1]:.4f}")
             print(f"    x_obj norm: {col.x_obj.norm().item():.4f}")
 
             # Show the dreamed prediction as a 5×5 image.
-            pred_img = col.predict_down().reshape(5, 5)
+            pred_img = col.predict_down()[0].reshape(5, 5)
             print("    Predicted image (5×5):")
             for r in range(5):
                 row_str = "      "

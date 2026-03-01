@@ -1,5 +1,5 @@
 """
-Predictive Coding Network — Phase 4: Temporal Predictive Coding
+Predictive Coding Network — Phase 4.5: Dendritic Gating + Non-linear Temporal
 
 Phase 1 (PCNetwork): A single CorticalColumn with What/Where/Action.
 Phase 2 (CorticalGrid): A 2D grid of CorticalColumn instances wired
@@ -10,6 +10,8 @@ hierarchical directed attention and sensorimotor search.
 Phase 4: Temporal predictive coding — columns remember their previous
 belief (x_obj_prev) and learn transition dynamics (W_trans), enabling
 prediction of future states and generative "dreaming".
+Phase 4.5: Dendritic gating (multiplicative interaction), non-linear
+temporal transitions, and overcomplete latent representations.
 
 This enables:
     - **Noise suppression**: columns vote to smooth out noisy patches.
@@ -22,6 +24,8 @@ This enables:
       columns and drive L5 motor output to physically scan for it.
     - **Temporal prediction** (Phase 4): columns learn transition
       dynamics and can dream / predict future states.
+    - **Dendritic gating** (Phase 4.5): location multiplicatively gates
+      object identity, enabling non-linear generative models.
 
 No autograd. No backpropagation. All dynamics are local ODEs
 minimising Free Energy (prediction error + lateral + top-down + temporal error).
@@ -504,7 +508,7 @@ class CorticalStack(nn.Module):
 
             # 2. Top-down: L2 prediction → per-column priors.
             td_priors = self._split_td_priors(
-                self.level2.predict_down()
+                self.level2.predict_down()[0]
             )
 
             # 3. Lateral: L1 neighbor contexts.
@@ -628,7 +632,7 @@ if __name__ == "__main__":
 
     grid = CorticalGrid(
         grid_h=3, grid_w=3,
-        obj_dim=8, loc_dim=4,
+        obj_dim=36, loc_dim=4,
         patch_h=3, patch_w=3,
         activation_fn_name="tanh",
     ).to(device)
@@ -702,9 +706,9 @@ if __name__ == "__main__":
 
     stack = CorticalStack(
         grid_h=3, grid_w=3,
-        l1_obj_dim=8, l1_loc_dim=4,
+        l1_obj_dim=36, l1_loc_dim=4,
         l1_patch_h=3, l1_patch_w=3,
-        l2_obj_dim=16, l2_loc_dim=4,
+        l2_obj_dim=64, l2_loc_dim=4,
         activation_fn_name="tanh",
     ).to(device)
     print(stack)
