@@ -1,5 +1,5 @@
 """
-Cortical Column — Phase 4.6: Precision Weighting + State Decay
+Cortical Column — Convention B (standard FEP: ε = prediction − input)
 
 A biologically-structured cortical column implementing the Thousand Brains
 theory.  Each CorticalColumn natively separates object identity ("What" /
@@ -14,37 +14,41 @@ and **non-linear temporal transitions**, with overcomplete latent spaces.
 Phase 4.6 adds **precision weighting** (Π scalars) for each error modality
 and a **Gaussian prior** (state decay) on latent variables.
 
+Error convention: ε = prediction − input (Bogacz 2017, PyMDP standard).
+With this convention, ∇F aligns with the raw error products, so every
+ODE and weight update uses strict subtraction for gradient descent.
+
 Mathematical foundation (Free Energy Principle):
     - L2/3 generative prediction (dendritic gating):
           pred_obj = W_obj @ x_obj
           pred_loc = W_loc @ x_loc
           prediction = tanh(pred_obj * pred_loc)   # element-wise multiply
-    - L4 sensory error:
-          err_sensory = sensory_input - prediction
+    - L4 sensory error (Convention B):
+          ε = prediction - sensory_input
     - Scaled error (chain rule through tanh):
-          err_scaled = err_sensory * (1 - prediction^2)
+          err_scaled = ε * (1 - prediction^2)
     - Lateral consensus error (Phase 2):
           err_lat = x_obj - W_lat @ neighbor_context
     - Top-down attention error (Phase 3):
           err_td = x_obj - top_down_prior
     - Temporal prediction error (Phase 4, non-linear):
           err_time = x_obj - tanh(W_trans @ x_obj_prev)
-    - Internal ODE settling (precision-weighted, with state decay):
-          dx_obj = π_s * W_obj.T @ (err_scaled * pred_loc)
-                 - π_l * err_lat - π_td * err_td - π_t * err_time
-                 - α * x_obj
-          dx_loc = π_s * W_loc.T @ (err_scaled * pred_obj) - α * x_loc
+    - Internal ODE settling (gradient descent, all terms subtract):
+          dx_obj = - π_s * W_obj.T @ (err_scaled * pred_loc)
+                   - π_l * err_lat - π_td * err_td - π_t * err_time
+                   - α * x_obj
+          dx_loc = - π_s * W_loc.T @ (err_scaled * pred_obj) - α * x_loc
     - L5 motor action (Active Inference):
-          action = -eta_a * (sensory_gradient.T @ error)
+          action = +eta_a * (sensory_gradient.T @ ε)
     - Variational Free Energy (precision-weighted):
-          F = ½ π_s ||err_sensory||² + ½ π_l ||err_lat||²
+          F = ½ π_s ||ε||² + ½ π_l ||err_lat||²
             + ½ π_td ||err_td||² + ½ π_t ||err_time||²
             + ½ α (||x_obj||² + ||x_loc||²)
-    - Hebbian learning (gated):
-          dW_obj   = eta_w * ((err_scaled * pred_loc).T @ x_obj)
-          dW_loc   = eta_w * ((err_scaled * pred_obj).T @ x_loc)
-          dW_lat   = eta_w * (err_lat.T @ neighbor_context)
-          dW_trans = eta_w * (err_time_scaled.T @ x_obj_prev)
+    - Weight learning (gradient descent):
+          W_obj -= η * (err_scaled * pred_loc).T @ x_obj
+          W_loc -= η * (err_scaled * pred_obj).T @ x_loc
+          W_lat += η * err_lat.T @ neighbor_context      (prior: additive)
+          W_trans += η * err_time_scaled.T @ x_obj_prev   (prior: additive)
             where err_time_scaled = err_time * (1 - temporal_pred^2)
 
 No autograd. No backpropagation. All dynamics are local ODEs
@@ -160,10 +164,11 @@ class CorticalColumn(nn.Module):
         pred_loc = W_loc @ x_loc
         prediction = tanh(pred_obj * pred_loc)   # element-wise multiply
 
-    The product rule gives gated gradients:
-        dx_obj = W_obj.T @ (err_scaled * pred_loc) - err_lat - err_td - err_time
-        dx_loc = W_loc.T @ (err_scaled * pred_obj)
-      where err_scaled = error * (1 - prediction^2)
+    Convention B (ε = p − s): the product rule gives gated gradients,
+    and gradient descent uses strict subtraction on all terms:
+        dx_obj = -W_obj.T @ (err_scaled * pred_loc) - err_lat - err_td - err_time
+        dx_loc = -W_loc.T @ (err_scaled * pred_obj)
+      where err_scaled = error * (1 - prediction^2)  [error = prediction - input]
 
     Non-linear temporal (Phase 4.5):
         temporal_pred = tanh(W_trans @ x_obj_prev)
@@ -344,10 +349,12 @@ class CorticalColumn(nn.Module):
     # ------------------------------------------------------------------
 
     def compute_error(self, sensory_input: Tensor) -> Tensor:
-        """Compute and store the L4 prediction error.
+        """Compute and store the L4 prediction error (Convention B).
+
+        Standard FEP convention: ε = prediction - input.
 
         .. math::
-            \\epsilon = \\text{sensory\\_input} - \\text{prediction}
+            \\epsilon = \\text{prediction} - \\text{sensory\\_input}
 
         Args:
             sensory_input: (batch, sensory_dim) — observed data.
@@ -356,7 +363,7 @@ class CorticalColumn(nn.Module):
             error: (batch, sensory_dim)
         """
         prediction, _, _ = self.predict_down()
-        self.error = sensory_input - prediction
+        self.error = prediction - sensory_input
         return self.error
 
     # ------------------------------------------------------------------
@@ -371,26 +378,23 @@ class CorticalColumn(nn.Module):
         neighbor_context: Optional[Tensor] = None,
         top_down_prior: Optional[Tensor] = None,
     ) -> None:
-        """One Euler step of the dual-state settling ODE.
+        """One Euler step of the dual-state settling ODE (Convention B).
 
-        Phase 4.5 uses **dendritic gating** (multiplicative interaction):
-        the prediction is ``tanh(pred_obj * pred_loc)`` instead of
-        ``tanh(pred_obj + pred_loc)``.  The product rule gives gated
-        gradients: each pathway's gradient is scaled by the other
-        pathway's value.
+        Convention B (ε = p − s): With this standard FEP error convention,
+        ``grad_obj`` is the positive gradient ∇F.  All ODE terms use
+        strict subtraction for gradient descent on free energy.
 
-        Phase 4.6 adds **precision weighting** (Π) for each error modality
-        and a **Gaussian prior** (state decay: -α·x) that prevents runaway
-        activations and ensures proper FEP free energy minimisation.
+        Dendritic gating (Phase 4.5): prediction = tanh(pred_obj * pred_loc).
+        Precision weighting and state decay (Phase 4.6).
 
         .. math::
-            dx_{obj} = \\pi_s \\cdot W_{obj}^T (\\text{err\\_scaled} \\ast p_{loc})
-                     - \\pi_l \\cdot \\text{err\\_lat}
-                     - \\pi_{td} \\cdot \\text{err\\_td}
-                     - \\pi_t \\cdot \\text{err\\_time}
-                     - \\alpha \\cdot x_{obj}
-            dx_{loc} = \\pi_s \\cdot W_{loc}^T (\\text{err\\_scaled} \\ast p_{obj})
-                     - \\alpha \\cdot x_{loc}
+            dx_{obj} = - \\pi_s \\cdot W_{obj}^T (\\text{err\\_scaled} \\ast p_{loc})
+                       - \\pi_l \\cdot \\text{err\\_lat}
+                       - \\pi_{td} \\cdot \\text{err\\_td}
+                       - \\pi_t \\cdot \\text{err\\_time}
+                       - \\alpha \\cdot x_{obj}
+            dx_{loc} = - \\pi_s \\cdot W_{loc}^T (\\text{err\\_scaled} \\ast p_{obj})
+                       - \\alpha \\cdot x_{loc}
 
         When ``freeze_obj=True``, only x_loc updates.
 
@@ -408,7 +412,11 @@ class CorticalColumn(nn.Module):
         pred_loc = self.x_loc @ self.W_loc.t()     # (B, sensory_dim)
         composite = pred_obj * pred_loc             # element-wise gating
         prediction = self.activation_fn(composite)
-        self.error = sensory_input - prediction
+
+        # Convention B (standard FEP): ε = prediction - input.
+        # With this convention, grad_obj = ∇F (positive gradient of F),
+        # so all ODE terms use strict subtraction for gradient descent.
+        self.error = prediction - sensory_input
 
         # Cache intermediates for learn().
         self._pred_obj = pred_obj
@@ -419,12 +427,13 @@ class CorticalColumn(nn.Module):
         deriv = self.activation_deriv(composite)    # (B, sensory_dim)
         err_scaled = self.error * deriv             # (B, sensory_dim)
 
-        # Dual-state update with gated gradients (product rule).
+        # Dual-state update: gradient descent on F.
+        # Because ε = p - s, grad_obj is ∇F_obj. All terms subtract.
         # Precision-weighted errors and Gaussian prior state decay (Phase 4.6).
         if not freeze_obj:
-            # Bottom-up sensory pressure — gated by pred_loc, weighted by pi_sensory.
+            # Bottom-up sensory gradient — gated by pred_loc, weighted by pi_sensory.
             grad_obj = (err_scaled * pred_loc) @ self.W_obj   # (B, obj_dim)
-            dx_obj = self.pi_sensory * grad_obj
+            dx_obj = -(self.pi_sensory * grad_obj)
 
             # Lateral consensus pressure (Phase 2).
             if neighbor_context is not None:
@@ -461,7 +470,7 @@ class CorticalColumn(nn.Module):
 
         # Location pathway — gated by pred_obj, with state decay.
         grad_loc = (err_scaled * pred_obj) @ self.W_loc   # (B, loc_dim)
-        dx_loc = self.pi_sensory * grad_loc - self.alpha * self.x_loc
+        dx_loc = -(self.pi_sensory * grad_loc) - self.alpha * self.x_loc
         self.x_loc = self.x_loc + eta_x * dx_loc
 
     # ------------------------------------------------------------------
@@ -476,12 +485,17 @@ class CorticalColumn(nn.Module):
         """Compute Active Inference motor commands from L5.
 
         The motor system acts on the *world* to reduce prediction error
-        by moving the sensor.  The action is the gradient of free energy
-        w.r.t. the sensory input, projected through the spatial gradient
-        of the sensor.
+        by moving the sensor.  With Convention B (ε = p - s), the
+        derivative of F w.r.t. sensory input is -ε, so gradient descent
+        on F w.r.t. action yields a positive sign:
 
         .. math::
-            a = \\eta_a \\cdot (\\nabla_{\\text{spatial}} s)^T \\cdot \\epsilon
+            \\frac{\\partial F}{\\partial a}
+              = \\frac{\\partial F}{\\partial s} \\cdot \\frac{\\partial s}{\\partial a}
+              = -\\epsilon \\cdot \\frac{\\partial s}{\\partial a}
+
+            a = -\\frac{\\partial F}{\\partial a}
+              = \\eta_a \\cdot \\epsilon \\cdot \\frac{\\partial s}{\\partial a}
 
         Args:
             sensory_gradient: (batch, sensory_dim, action_dim) — spatial
@@ -498,13 +512,15 @@ class CorticalColumn(nn.Module):
             )
 
         # Active Inference: minimise free energy by acting on the world.
-        #   dF/da = error * ds/da   (chain rule through sensory input)
-        #   action = -dF/da         (gradient DESCENT on free energy)
+        # Convention B (ε = p - s):
+        #   dF/ds = -ε  (F = ½||p-s||², dF/ds = -(p-s) = -ε)
+        #   dF/da = dF/ds · ds/da = -ε · ds/da
+        #   action = -dF/da = +ε · ds/da  (gradient descent on F)
         #
         # error: (B, sensory_dim)
         # sensory_gradient: (B, sensory_dim, action_dim)
         # result: (B, action_dim)
-        action = -eta_a * torch.einsum("bs,bsa->ba", self.error, sensory_gradient)
+        action = eta_a * torch.einsum("bs,bsa->ba", self.error, sensory_gradient)
         return action
 
     # ------------------------------------------------------------------
@@ -516,18 +532,23 @@ class CorticalColumn(nn.Module):
         eta_w: float = 0.001,
         neighbor_context: Optional[Tensor] = None,
     ) -> None:
-        """Hebbian update for generative, lateral, and temporal weight matrices.
+        """Gradient descent on weights (Convention B: ε = p - s).
 
-        Phase 4.5: Uses gated error signals matching the chain-rule
-        derivatives from dendritic gating and non-linear temporal transitions.
+        Generative weights (W_obj, W_loc): With ε = p - s, the gradient
+        ∇_W F is in the same direction as the raw Hebbian product, so
+        gradient descent uses W -= η · ∇F  (subtraction).
+
+        Prior weights (W_lat, W_trans): The prior error definitions
+        (err_lat = x - Wx_nbr) already follow belief - expectation,
+        and ∇_W F_lat = -err_lat · x_nbr^T.  Gradient descent
+        W -= η · ∇F = W += η · dW  (addition, unchanged).
 
         .. math::
             \\text{err\\_scaled} = \\epsilon \\cdot (1 - \\text{prediction}^2)
-            \\Delta W_{obj}   = \\eta_w \\cdot (\\text{err\\_scaled} \\ast p_{loc})^T \\cdot x_{obj}
-            \\Delta W_{loc}   = \\eta_w \\cdot (\\text{err\\_scaled} \\ast p_{obj})^T \\cdot x_{loc}
-            \\Delta W_{lat}   = \\eta_w \\cdot \\text{err\\_lat}^T \\cdot \\bar{x}_{obj}^{\\text{nbr}}
-            \\text{err\\_time\\_scaled} = \\text{err\\_time} \\cdot (1 - \\text{temporal\\_pred}^2)
-            \\Delta W_{trans} = \\eta_w \\cdot \\text{err\\_time\\_scaled}^T \\cdot x_{obj\\_prev}
+            W_{obj} -= \\eta_w \\cdot (\\text{err\\_scaled} \\ast p_{loc})^T \\cdot x_{obj}
+            W_{loc} -= \\eta_w \\cdot (\\text{err\\_scaled} \\ast p_{obj})^T \\cdot x_{loc}
+            W_{lat} += \\eta_w \\cdot \\text{err\\_lat}^T \\cdot \\bar{x}_{obj}^{\\text{nbr}}
+            W_{trans} += \\eta_w \\cdot \\text{err\\_time\\_scaled}^T \\cdot x_{obj\\_prev}
 
         Averaged over the batch.
 
@@ -550,21 +571,25 @@ class CorticalColumn(nn.Module):
         # Gated error: error scaled by activation derivative (tanh shortcut).
         err_scaled = self.error * (1.0 - self._prediction.pow(2))
 
-        # dW_obj: gated by pred_loc (product rule).
+        # dW_obj: ∇_W F for generative object weights, gated by pred_loc.
         # (sensory_dim, B) @ (B, obj_dim) -> (sensory_dim, obj_dim)
         dW_obj = ((err_scaled * self._pred_loc).t() @ self.x_obj) / batch_size
-        # dW_loc: gated by pred_obj (product rule).
+        # dW_loc: ∇_W F for generative location weights, gated by pred_obj.
         dW_loc = ((err_scaled * self._pred_obj).t() @ self.x_loc) / batch_size
 
-        self.W_obj.data += eta_w * dW_obj
-        self.W_loc.data += eta_w * dW_loc
+        # Gradient descent: W -= η · ∇F  (Convention B).
+        self.W_obj.data -= eta_w * dW_obj
+        self.W_loc.data -= eta_w * dW_loc
 
-        # Lateral weight update (Phase 2) — unchanged.
+        # Lateral weight update (Phase 2).
+        # F_lat = ½||x - Wx_nbr||², ∇_W F = -err_lat · x_nbr^T.
+        # Gradient descent: W -= η · (-err_lat · x_nbr^T) = W += η · dW.
         if neighbor_context is not None and self.err_lat is not None:
             dW_lat = (self.err_lat.t() @ neighbor_context) / batch_size
             self.W_lat.data += eta_w * dW_lat
 
         # Temporal weight update (Phase 4.5, non-linear).
+        # Same logic as lateral: prior error, additive update.
         if (self.x_obj_prev is not None
                 and self.err_time is not None
                 and self._temporal_pred is not None):
