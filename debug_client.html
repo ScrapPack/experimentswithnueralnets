@@ -21,7 +21,7 @@
 </head>
 <body>
 <h1>Predictive Coding Gamestate Engine — Debug View</h1>
-<p class="info">Left-click = strike (density). Right-click = heat (thermal). Stone (left, dark) is brittle. Sand (right, gold) is weak.</p>
+<p class="info">Left-click = strike. Right-click = heat. Stone (dark) | Wood (brown, flammable) | Ice (cyan, melts).</p>
 <div id="grid"></div>
 <p class="info">
   Strikes: <span id="strikes">0</span> |
@@ -36,7 +36,7 @@
 <script>
 const W = 10, H = 10, URL = "http://127.0.0.1:5001";
 let strikes = 0, heats = 0, busy = false, destroyedSet = new Set();
-let materials = [];  // "stone" or "sand" per cell, fetched once
+let materials = [];  // "stone", "wood", or "ice" per cell, fetched once
 const GRID_CELLS = W * H;  // 100
 
 const grid = document.getElementById("grid");
@@ -72,15 +72,19 @@ function updateGrid(state) {
     const mat = materials[i] || "stone";
     let r, g, b;
     if (t > 0.9) {
-      r = 135; g = 200; b = 235;
+      r = 135; g = 200; b = 235;           // sky blue (air)
     } else if (mat === "stone") {
-      r = 60 + t * 120;
+      r = 60 + t * 120;                    // dark slate → light gray
       g = 65 + t * 120;
       b = 85 + t * 130;
-    } else {
-      r = 190 + t * 40;
-      g = 160 + t * 60;
-      b = 80 + t * 100;
+    } else if (mat === "wood") {
+      r = 101 + t * 100;                   // warm brown → lighter brown
+      g = 67 + t * 100;
+      b = 33 + t * 80;
+    } else {                                // ice: pale cyan → white
+      r = 175 + t * 75;
+      g = 238 + t * 12;
+      b = 238 + t * 12;
     }
     // Heat overlay: blend toward fiery orange (255, 76, 0).
     if (hv > -0.8) {
@@ -97,7 +101,7 @@ function updateGrid(state) {
     cells[i].textContent = hv > -0.8
       ? `${dv.toFixed(1)}|${hv.toFixed(1)}`
       : dv.toFixed(2);
-    cells[i].style.color = t > 0.5 ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.5)";
+    cells[i].style.color = (t > 0.5 || mat === "ice") ? "rgba(0,0,0,0.5)" : "rgba(255,255,255,0.5)";
     if (dv < 0.95) weakened++;
   }
   document.getElementById("weakened").textContent = weakened;
@@ -112,8 +116,10 @@ async function fetchState() {
     // /get_state returns {"state": [...], "materials": [...]}
     materials = data.materials;
     updateGrid(data.state);
-    const stoneCount = materials.filter(m => m === "stone").length;
-    log(`Initial state loaded — ${stoneCount} stone + ${100 - stoneCount} sand — ${data.state.length} dims`);
+    const counts = {};
+    materials.forEach(m => counts[m] = (counts[m] || 0) + 1);
+    const parts = Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(" + ");
+    log(`Initial state loaded — ${parts} — ${data.state.length} dims`);
   } catch(e) { log("ERROR: " + e.message); }
 }
 

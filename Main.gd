@@ -11,9 +11,10 @@
 ##   Density: +1.0 = solid, −1.0 = air.
 ##   Thermal: −1.0 = cold, +1.0 = hot.
 ##
-## Materials (Phase 8):
-##   Stone (left half, x < 5):  dark slate  rgb(60, 65, 85)
-##   Sand  (right half, x ≥ 5): golden brown rgb(190, 160, 80)
+## Materials (Phase 10):
+##   Stone (x < 3):    dark slate   rgb(60, 65, 85)
+##   Wood  (3 ≤ x < 7): warm brown  rgb(101, 67, 33)
+##   Ice   (x ≥ 7):    pale cyan    rgb(175, 238, 238)
 ##
 ## Heat overlay: hot cells blend toward fiery orange rgb(255, 76, 0).
 ## Left-click = strike (density).  Right-click / Shift+click = heat.
@@ -34,7 +35,7 @@ const SERVER_URL: String = "http://127.0.0.1:5001"
 # ---------------------------------------------------------------------------
 
 var blocks: Array[ColorRect] = []
-var materials: Array = []           # "stone" or "sand" per cell (from server)
+var materials: Array = []           # "stone", "wood", or "ice" per cell
 var http_request: HTTPRequest
 var request_pending: bool = false   # guard against overlapping requests
 
@@ -49,10 +50,12 @@ func _ready() -> void:
 			var block := ColorRect.new()
 			block.size = Vector2(38, 38)                         # 2 px gap
 			block.position = Vector2(x * BLOCK_SIZE + 1, y * BLOCK_SIZE + 1)
-			if x < 5:
-				block.color = Color(60.0/255, 65.0/255, 85.0/255)  # stone = dark slate
+			if x < 3:
+				block.color = Color(60.0/255, 65.0/255, 85.0/255)    # stone = dark slate
+			elif x < 7:
+				block.color = Color(101.0/255, 67.0/255, 33.0/255)   # wood = warm brown
 			else:
-				block.color = Color(190.0/255, 160.0/255, 80.0/255)  # sand = golden brown
+				block.color = Color(175.0/255, 238.0/255, 238.0/255) # ice = pale cyan
 			add_child(block)
 			blocks.append(block)
 
@@ -172,25 +175,37 @@ func update_grid(state: Array) -> void:
 		if i < materials.size():
 			mat = materials[i]
 		else:
-			mat = "stone" if (i % GRID_W) < 5 else "sand"
+			# Fallback: stone / wood / ice by column.
+			var col: int = i % GRID_W
+			if col < 3:
+				mat = "stone"
+			elif col < 7:
+				mat = "wood"
+			else:
+				mat = "ice"
 
 		var r: float
 		var g: float
 		var b: float
 
 		if t > 0.9:
-			# Air / destroyed — sky blue (same for both materials)
+			# Air / destroyed — sky blue
 			r = 135.0; g = 200.0; b = 235.0
 		elif mat == "stone":
-			# Stone: dark slate-gray → light gray-blue
+			# Stone: dark slate → light gray-blue
 			r = 60.0 + t * 120.0
 			g = 65.0 + t * 120.0
 			b = 85.0 + t * 130.0
+		elif mat == "wood":
+			# Wood: warm brown → lighter brown
+			r = 101.0 + t * 100.0
+			g = 67.0 + t * 100.0
+			b = 33.0 + t * 80.0
 		else:
-			# Sand: warm golden-brown → pale tan
-			r = 190.0 + t * 40.0
-			g = 160.0 + t * 60.0
-			b = 80.0 + t * 100.0
+			# Ice: pale cyan → white
+			r = 175.0 + t * 75.0
+			g = 238.0 + t * 12.0
+			b = 238.0 + t * 12.0
 
 		# Heat overlay: blend toward fiery orange (255, 76, 0).
 		if heat_val > -0.8:

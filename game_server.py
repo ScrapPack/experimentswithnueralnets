@@ -10,16 +10,22 @@ World representation:
     Indices 0–99:   Density (+1.0 = solid, −1.0 = air)
     Indices 100–199: Thermal (−1.0 = cold, +1.0 = hot)
 
-Materials (Phase 8):
-    The grid is split into two materials with per-cell property maps:
-      Stone (left half, x < 5) — brittle and strong:
-        precision = 1.5 (amplifies stress → brittle shattering)
-        tensile   = 0.95 (passes stress easily → deep fractures)
-        threshold = −0.1 (holds until severely damaged)
-      Sand (right half, x ≥ 5) — malleable and weak:
-        precision = 0.5 (dampens stress → soft absorption)
-        tensile   = 0.4 (stress decays fast → localized crumbling)
-        threshold = 0.4 (crumbles very easily)
+Materials (Phase 10):
+    The grid is split into three vertical material columns:
+      Stone (x < 3) — brittle, heat-proof:
+        precision=1.5  tensile=0.95  threshold=−0.1  thermal_tolerance=2.0
+      Wood (3 ≤ x < 7) — flammable, exothermic:
+        precision=0.8  tensile=0.6   threshold=0.0   thermal_tolerance=0.2
+      Ice (x ≥ 7) — weak, melts, endothermic:
+        precision=0.5  tensile=0.4   threshold=0.2   thermal_tolerance=−0.5
+
+Cross-channel coupling (Phase 10):
+    Collapse triggers: density < threshold OR thermal > thermal_tolerance.
+    Phase-change reactions on collapse:
+      Wood → +1.0 heat stress (exothermic combustion).
+      Ice  → 0.5 cold stress  (endothermic melting absorbs heat).
+      Stone → no thermal reaction.
+    Air dissipates heat: destroyed cells lose 0.5 thermal each resolution.
 
 Physics loop (on strike):
     1. Mark the cell as permanently destroyed (damage mask).
@@ -141,38 +147,46 @@ _RADIANCE_KERNEL = torch.tensor(
 # Material properties — heterogeneous 2D maps
 # ---------------------------------------------------------------------------
 #
-# precision_map : How much a cell amplifies stress on destruction
-#                 (brittleness).  High → sharp fracture; low → soft crumble.
-# tensile_map   : How efficiently a cell transfers stress to neighbours
-#                 during propagation (0 = absorbs all, 1 = passes all).
-# threshold_map : The value below which a cell auto-collapses.
+# precision_map         : Stress amplification on destruction (brittleness).
+# tensile_map           : Stress transfer to neighbours (0=absorb, 1=pass).
+# threshold_map         : Density below which a cell auto-collapses.
+# thermal_tolerance_map : Thermal value above which a cell melts/ignites.
 #
 
-precision_map = torch.ones(GRID_H, GRID_W, device=device)
-tensile_map   = torch.ones(GRID_H, GRID_W, device=device)
-threshold_map = torch.full((GRID_H, GRID_W), COLLAPSE_THRESHOLD, device=device)
+precision_map         = torch.ones(GRID_H, GRID_W, device=device)
+tensile_map           = torch.ones(GRID_H, GRID_W, device=device)
+threshold_map         = torch.full((GRID_H, GRID_W), COLLAPSE_THRESHOLD, device=device)
+thermal_tolerance_map = torch.full((GRID_H, GRID_W), 2.0, device=device)
 
-# Stone — left half (x < 5): brittle and strong.
-precision_map[:, :5] = 1.5
-tensile_map[:, :5]   = 0.95
-threshold_map[:, :5] = -0.1
+# Stone — left column (x < 3): brittle, heat-proof.
+precision_map[:, :3]         = 1.5
+tensile_map[:, :3]           = 0.95
+threshold_map[:, :3]         = -0.1
+thermal_tolerance_map[:, :3] = 2.0    # effectively infinite
 
-# Sand — right half (x ≥ 5): malleable and weak.
-precision_map[:, 5:] = 0.5
-tensile_map[:, 5:]   = 0.4
-threshold_map[:, 5:] = 0.4
+# Wood — middle columns (3 ≤ x < 7): flammable, exothermic.
+precision_map[:, 3:7]         = 0.8
+tensile_map[:, 3:7]           = 0.6
+threshold_map[:, 3:7]         = 0.0
+thermal_tolerance_map[:, 3:7] = 0.2   # ignites easily
+
+# Ice — right columns (x ≥ 7): weak, melts, endothermic.
+precision_map[:, 7:]         = 0.5
+tensile_map[:, 7:]           = 0.4
+threshold_map[:, 7:]         = 0.2
+thermal_tolerance_map[:, 7:] = -0.5   # melts even from slight warmth
 
 # Pre-shaped for element-wise use inside _propagate_stress.
 _tensile_map_2d = tensile_map.view(1, 1, GRID_H, GRID_W)
 
 # Flat material-label array returned by the API.
 _material_labels: list[str] = [
-    "stone" if x < 5 else "sand"
+    "stone" if x < 3 else ("wood" if x < 7 else "ice")
     for y in range(GRID_H)
     for x in range(GRID_W)
 ]
 
-print(f"Materials: stone (x<5) | sand (x≥5)")
+print(f"Materials: stone (x<3) | wood (3≤x<7) | ice (x≥7)")
 
 
 # ---------------------------------------------------------------------------
@@ -243,14 +257,13 @@ def _propagate_stress(
 
     Before the ``max``, each convolution result is element-wise
     multiplied by ``_tensile_map_2d`` — the material's tensile
-    property.  Stone (0.95) passes stress almost undiminished
-    (deep fractures); sand (0.40) attenuates rapidly (local crumble).
+    property.  Stone (0.95) passes stress almost undiminished;
+    wood (0.60) moderate; ice (0.40) attenuates rapidly.
 
     Effective decay per hop (kernel weight × tensile):
         Stone downward: 0.30 × 0.95 = 0.285
-        Sand  downward: 0.30 × 0.40 = 0.120
-        Stone lateral:  0.15 × 0.95 = 0.143
-        Sand  lateral:  0.15 × 0.40 = 0.060
+        Wood  downward: 0.30 × 0.60 = 0.180
+        Ice   downward: 0.30 × 0.40 = 0.120
 
     Args:
         state:  (1, 200) full world state (density + thermal).
@@ -317,6 +330,152 @@ def _propagate_heat(
     return result
 
 
+def _propagate_cold(
+    state: torch.Tensor,
+    stress: torch.Tensor,
+) -> torch.Tensor:
+    """Propagate cooling with the radiance kernel (endothermic).
+
+    Same max-propagation as _propagate_heat, but SUBTRACTS thermal
+    energy (moves toward −1.0) instead of adding it.  Used for
+    ice-melt cooling that absorbs heat from neighbouring cells.
+
+    Args:
+        state:  (1, 200) full world state.
+        stress: (1, 100) cooling magnitude (positive values = amount
+                of cooling to apply).
+
+    Returns:
+        (1, 200) world state with thermal slice cooled.
+    """
+    result = state.clone()
+
+    spread = stress.view(1, 1, GRID_H, GRID_W)
+    for _ in range(PROPAGATION_PASSES):
+        padded = F.pad(spread, [1, 1, 1, 1], mode="constant", value=0.0)
+        spread = torch.max(spread, F.conv2d(padded, _RADIANCE_KERNEL))
+
+    # Subtract heat from the thermal slice (100–199).
+    cooling = spread.view(1, GRID_CELLS) * STRESS_SCALE
+    result[:, GRID_CELLS:] = (
+        result[:, GRID_CELLS:] - cooling
+    ).clamp(-1.0, 1.0)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Unified cascade resolution — cross-channel physics
+# ---------------------------------------------------------------------------
+
+def _resolve_physics_cascades() -> None:
+    """Evaluate cascading collapses from BOTH structural and thermal causes.
+
+    Called after the initial perturbation (strike or heat) to resolve
+    all secondary effects: cascading collapses, phase-change reactions,
+    dual-channel propagation, and thermal dissipation in air.
+
+    Collapse conditions (per cell, each round):
+      - Structural: density < threshold_map
+      - Thermal:    thermal > thermal_tolerance_map
+
+    Phase-change thermal reactions on collapse:
+      - Wood (exothermic):  injects +1.0 heat stress (combustion)
+      - Ice  (endothermic): injects  0.5 cold stress (melting absorbs heat)
+      - Stone:              no thermal reaction
+
+    After all cascade rounds, air dissipates heat: every destroyed cell's
+    thermal value is reduced by 0.5 (clamped to −1.0).
+    """
+    global current_world_state
+
+    for _settle in range(MAX_SETTLE_ROUNDS):
+        # Scan for cells that should collapse (structural OR thermal).
+        newly_collapsed: list[tuple[int, float, float]] = []
+        for i in range(GRID_CELLS):
+            if i in destroyed_cells:
+                continue
+            y_i = i // GRID_W
+            x_i = i % GRID_W
+            density_val = current_world_state[0, i].item()
+            thermal_val = current_world_state[0, i + GRID_CELLS].item()
+
+            structural_fail = density_val < threshold_map[y_i, x_i].item()
+            thermal_fail = thermal_val > thermal_tolerance_map[y_i, x_i].item()
+
+            if structural_fail or thermal_fail:
+                newly_collapsed.append((i, density_val, thermal_val))
+
+        if not newly_collapsed:
+            break
+
+        # Mark all newly collapsed cells as destroyed.
+        for i, _d, _t in newly_collapsed:
+            destroyed_cells.add(i)
+        _force_destroyed(current_world_state)
+
+        # Build per-cell stress tensors for dual propagation.
+        struct_stress = torch.zeros(1, GRID_CELLS, device=device)
+        heat_stress   = torch.zeros(1, GRID_CELLS, device=device)
+        cold_stress   = torch.zeros(1, GRID_CELLS, device=device)
+
+        for i, old_d, old_t in newly_collapsed:
+            y_i = i // GRID_W
+            x_i = i % GRID_W
+            mat = _material_labels[i]
+
+            # Structural stress: load released × precision.
+            struct_stress[0, i] = (
+                abs(old_d + 1.0) * precision_map[y_i, x_i].item()
+            )
+
+            # Phase-change thermal reaction.
+            if mat == "wood":
+                heat_stress[0, i] = 1.0    # exothermic combustion
+            elif mat == "ice":
+                cold_stress[0, i] = 0.5    # endothermic melting
+
+        # Dual propagation — structural, heating, and cooling.
+        if struct_stress.max().item() > 0:
+            current_world_state = _propagate_stress(
+                current_world_state, struct_stress,
+            )
+        if heat_stress.max().item() > 0:
+            current_world_state = _propagate_heat(
+                current_world_state, heat_stress,
+            )
+        if cold_stress.max().item() > 0:
+            current_world_state = _propagate_cold(
+                current_world_state, cold_stress,
+            )
+
+        _force_destroyed(current_world_state)
+
+        # Log with material labels and collapse reason.
+        tags = []
+        for i, old_d, old_t in newly_collapsed:
+            y_i = i // GRID_W
+            x_i = i % GRID_W
+            reason = ""
+            if old_d < threshold_map[y_i, x_i].item():
+                reason += "S"
+            if old_t > thermal_tolerance_map[y_i, x_i].item():
+                reason += "T"
+            tags.append(f"{i}:{_material_labels[i]}/{reason}")
+        print(
+            f"    cascade round {_settle + 1}: "
+            f"{len(newly_collapsed)} collapsed [{', '.join(tags)}]",
+            flush=True,
+        )
+
+    # State-dependent decay: air dissipates heat.
+    # Destroyed cells (air) cannot hold thermal energy — reduce by 0.5.
+    for d in destroyed_cells:
+        thermal_idx = d + GRID_CELLS
+        old_t = current_world_state[0, thermal_idx].item()
+        current_world_state[0, thermal_idx] = max(old_t - 0.5, -1.0)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -339,7 +498,7 @@ def get_state():
 
     ``state`` contains 200 values: indices 0–99 are density,
     indices 100–199 are thermal.  ``materials`` is a flat list of
-    ``"stone"`` or ``"sand"`` for each cell (row-major, 100 entries).
+    ``"stone"``, ``"wood"``, or ``"ice"`` per cell (row-major, 100).
     """
     state_list = current_world_state.squeeze(0).cpu().tolist()
     return jsonify({"state": state_list, "materials": _material_labels})
@@ -347,13 +506,12 @@ def get_state():
 
 @app.route("/strike", methods=["POST"])
 def strike():
-    """Destroy a block and resolve the structural physics.
+    """Destroy a block and resolve structural + cross-channel physics.
 
     1. Mark the cell as permanently destroyed.
-    2. Run inference — the network's sensory prediction error reveals
-       where it is structurally "surprised" by the damage.
-    3. Propagate that stress spatially with a gravity-biased kernel.
-    4. Weaken cells proportionally; destroyed cells stay at −1.
+    2. Run inference — the network reacts to the damage.
+    3. Propagate structural stress with the gravity kernel.
+    4. Unified cascade: structural & thermal collapse, phase changes.
 
     Expects JSON: ``{"x": <int>, "y": <int>}``
     Returns: flat JSON list of 200 floats (the new world state).
@@ -371,26 +529,16 @@ def strike():
     destroyed_cells.add(idx)
 
     with torch.no_grad():
-        # 0. Snapshot the old cell value (used for stress magnitude).
         old_value = current_world_state[0, idx].item()
-
-        # 1. Force all destroyed cells to −1 (damage is permanent).
         _force_destroyed(current_world_state)
 
-        # 2. Run inference — the network settles its beliefs given
-        #    the damaged sensory input.
         net.infer(
             current_world_state, steps=STRIKE_INFER_STEPS, eta_x=STRIKE_ETA_X,
         )
 
-        # 3. Stress = load released × material precision.
-        #    Habituation (load-based): |old − (−1)| = old + 1.
-        #    Precision modulates brittleness:
-        #      Stone (1.5) amplifies stress → sharp fractures.
-        #      Sand  (0.5) dampens stress  → soft crumble.
         load_released = abs(old_value + 1.0)
         stress_magnitude = load_released * precision_map[y, x].item()
-        mat_label = "stone" if x < 5 else "sand"
+        mat_label = _material_labels[idx]
         print(
             f"  Strike ({x},{y}) idx={idx} [{mat_label}]  "
             f"old={old_value:.3f}  load={load_released:.3f}  "
@@ -400,65 +548,11 @@ def strike():
 
         stress = torch.zeros(1, GRID_CELLS, device=device)
         stress[0, idx] = stress_magnitude
-
-        # 4. Propagate stress spatially (gravity-biased max-propagation)
-        #    and weaken cells proportionally (density slice only).
         current_world_state = _propagate_stress(current_world_state, stress)
-
-        # 5. Destroyed cells are always −1.
         _force_destroyed(current_world_state)
 
-        # 6. Auto-collapse settle loop — cells that drop below the
-        #    collapse threshold are added to destroyed_cells.  Each
-        #    newly collapsed cell seeds a fresh round of stress
-        #    propagation (stress = load released), enabling cascading
-        #    chain reactions.
-        for _settle in range(MAX_SETTLE_ROUNDS):
-            newly_collapsed: list[tuple[int, float]] = []
-            for i in range(GRID_CELLS):
-                val = current_world_state[0, i].item()
-                y_i = i // GRID_W
-                x_i = i % GRID_W
-                # Per-material threshold: stone (−0.1) holds longer;
-                # sand (0.4) crumbles at the first sign of weakness.
-                if (
-                    i not in destroyed_cells
-                    and val < threshold_map[y_i, x_i].item()
-                ):
-                    newly_collapsed.append((i, val))
-
-            if not newly_collapsed:
-                break
-
-            for i, _val in newly_collapsed:
-                destroyed_cells.add(i)
-
-            # Snapshot values BEFORE forcing to −1 (for stress calc).
-            old_vals = {i: v for i, v in newly_collapsed}
-            _force_destroyed(current_world_state)
-
-            # Propagate stress from each newly collapsed cell,
-            # modulated by that cell's material precision.
-            for i, old_v in newly_collapsed:
-                y_i = i // GRID_W
-                x_i = i % GRID_W
-                cascade_stress = (
-                    abs(old_v + 1.0) * precision_map[y_i, x_i].item()
-                )
-                stress = torch.zeros(1, GRID_CELLS, device=device)
-                stress[0, i] = cascade_stress
-                current_world_state = _propagate_stress(
-                    current_world_state, stress,
-                )
-
-            _force_destroyed(current_world_state)
-
-            collapsed_ids = [i for i, _ in newly_collapsed]
-            print(
-                f"    cascade round {_settle + 1}: "
-                f"{len(newly_collapsed)} cells collapsed {collapsed_ids}",
-                flush=True,
-            )
+        # Unified cascade: structural & thermal collapse + phase changes.
+        _resolve_physics_cascades()
 
     state_list = current_world_state.squeeze(0).cpu().tolist()
     return jsonify(state_list)
@@ -466,12 +560,13 @@ def strike():
 
 @app.route("/heat", methods=["POST"])
 def heat():
-    """Apply heat to a cell and propagate thermal energy.
+    """Apply heat to a cell, propagate, and resolve cross-channel cascades.
 
     1. Force the cell's thermal value to +1.0 (maximum heat).
     2. Run inference — the network reacts to the thermal anomaly.
-    3. Propagate thermal stress with the radiance kernel (uniform,
-       no tensile dampening — heat flows freely).
+    3. Propagate thermal stress with the radiance kernel.
+    4. Unified cascade: thermal collapse (wood ignites, ice melts),
+       structural fallout, phase-change reactions.
 
     Expects JSON: ``{"x": <int>, "y": <int>}``
     Returns: flat JSON list of 200 floats (the new world state).
@@ -486,37 +581,31 @@ def heat():
         return jsonify({"error": f"({x}, {y}) out of bounds"}), 400
 
     grid_idx = y * GRID_W + x
-    thermal_idx = grid_idx + GRID_CELLS  # offset into thermal slice
+    thermal_idx = grid_idx + GRID_CELLS
 
     with torch.no_grad():
         old_thermal = current_world_state[0, thermal_idx].item()
-
-        # 1. Force maximum heat at the target cell.
         current_world_state[0, thermal_idx] = 1.0
 
-        # 2. Run inference — the network settles given the thermal spike.
         net.infer(
             current_world_state, steps=STRIKE_INFER_STEPS, eta_x=STRIKE_ETA_X,
         )
 
-        # 3. Thermal stress = surprise at this cell.
-        #    A cold cell (−1 → +1) produces maximum stress (2.0);
-        #    an already-warm cell (0.5 → +1) produces less (0.5).
         thermal_stress = abs(old_thermal - 1.0)
-        mat_label = "stone" if x < 5 else "sand"
+        mat_label = _material_labels[grid_idx]
         print(
             f"  Heat ({x},{y}) idx={grid_idx} [{mat_label}]  "
             f"old_t={old_thermal:.3f}  stress={thermal_stress:.3f}",
             flush=True,
         )
 
-        # 4. Propagate thermal stress with the radiance kernel.
         stress = torch.zeros(1, GRID_CELLS, device=device)
         stress[0, grid_idx] = thermal_stress
         current_world_state = _propagate_heat(current_world_state, stress)
-
-        # 5. Ensure destroyed density cells stay destroyed.
         _force_destroyed(current_world_state)
+
+        # Unified cascade: thermal collapse + phase changes.
+        _resolve_physics_cascades()
 
     state_list = current_world_state.squeeze(0).cpu().tolist()
     return jsonify(state_list)
