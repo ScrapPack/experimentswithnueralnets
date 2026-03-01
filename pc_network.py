@@ -1,5 +1,5 @@
 """
-Predictive Coding Network — Phase 4.5: Dendritic Gating + Non-linear Temporal
+Predictive Coding Network — Phase 5: Hippocampal Replay
 
 Phase 1 (PCNetwork): A single CorticalColumn with What/Where/Action.
 Phase 2 (CorticalGrid): A 2D grid of CorticalColumn instances wired
@@ -12,6 +12,10 @@ belief (x_obj_prev) and learn transition dynamics (W_trans), enabling
 prediction of future states and generative "dreaming".
 Phase 4.5: Dendritic gating (multiplicative interaction), non-linear
 temporal transitions, and overcomplete latent representations.
+Phase 4.6: Precision weighting and state decay.
+Phase 5: Hippocampal replay — EpisodicBuffer stores waking sensory
+frames; consolidate() replays shuffled batches to update weights
+without catastrophic interference.
 
 This enables:
     - **Noise suppression**: columns vote to smooth out noisy patches.
@@ -26,6 +30,8 @@ This enables:
       dynamics and can dream / predict future states.
     - **Dendritic gating** (Phase 4.5): location multiplicatively gates
       object identity, enabling non-linear generative models.
+    - **Catastrophic interference prevention** (Phase 5): episodic
+      replay distributes weight updates across the full memory trace.
 
 No autograd. No backpropagation. All dynamics are local ODEs
 minimising Free Energy (prediction error + lateral + top-down + temporal error).
@@ -42,6 +48,82 @@ import torch.nn as nn
 from torch import Tensor
 
 from pc_layer import CorticalColumn, _get_device
+
+
+# ---------------------------------------------------------------------------
+# EpisodicBuffer — hippocampal replay memory (Phase 5)
+# ---------------------------------------------------------------------------
+
+class EpisodicBuffer:
+    """FIFO episodic memory buffer (hippocampal analogue).
+
+    Biological motivation: the hippocampus stores recent waking experiences
+    as discrete episodic traces.  During sleep (or idle consolidation), these
+    traces are replayed in shuffled order so that cortical weight updates are
+    distributed across the full history, preventing catastrophic interference.
+
+    Stores raw sensory frames as 1-D tensors on CPU to avoid GPU memory
+    pressure.  ``sample()`` returns a stacked batch of randomly chosen
+    frames, moved to the caller's device by ``consolidate()``.
+
+    Args:
+        capacity: Maximum number of frames to store (FIFO eviction).
+    """
+
+    def __init__(self, capacity: int = 10_000) -> None:
+        self.capacity = capacity
+        self._buffer: list[Tensor] = []
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+
+    def store(self, frame: Tensor) -> None:
+        """Append one or more frames.  If batched (B, D), stores each row."""
+        frame = frame.detach().cpu()
+        if frame.dim() == 2:
+            for row in frame:
+                self._push(row)
+        elif frame.dim() == 1:
+            self._push(frame)
+        else:
+            raise ValueError(
+                f"EpisodicBuffer.store expects 1-D or 2-D tensor, got {frame.dim()}-D"
+            )
+
+    def _push(self, x: Tensor) -> None:
+        """Push a single 1-D frame, evicting the oldest if at capacity."""
+        if len(self._buffer) >= self.capacity:
+            self._buffer.pop(0)
+        self._buffer.append(x)
+
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
+
+    def sample(self, batch_size: int) -> Tensor:
+        """Return (batch_size, D) tensor of randomly sampled frames.
+
+        Samples without replacement.  If ``batch_size`` exceeds the
+        number of stored frames, returns all stored frames (shuffled).
+        """
+        n = min(batch_size, len(self._buffer))
+        indices = torch.randperm(len(self._buffer))[:n]
+        return torch.stack([self._buffer[i] for i in indices])
+
+    # ------------------------------------------------------------------
+    # Housekeeping
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._buffer)
+
+    def clear(self) -> None:
+        """Remove all stored frames."""
+        self._buffer.clear()
+
+    def __repr__(self) -> str:
+        return f"EpisodicBuffer(capacity={self.capacity}, stored={len(self)})"
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +218,7 @@ class CorticalGrid(nn.Module):
         patch_h:     Height of the local sensory patch per column.
         patch_w:     Width of the local sensory patch per column.
         activation_fn_name: Activation for the generative model.
+        buffer_capacity: Max frames in the episodic replay buffer.
     """
 
     def __init__(
@@ -147,6 +230,7 @@ class CorticalGrid(nn.Module):
         patch_h: int = 3,
         patch_w: int = 3,
         activation_fn_name: str = "tanh",
+        buffer_capacity: int = 10_000,
     ) -> None:
         super().__init__()
 
@@ -186,6 +270,9 @@ class CorticalGrid(nn.Module):
                 if c < grid_w - 1:
                     nbrs.append(r * grid_w + (c + 1))           # Right
                 self._neighbor_idx.append(nbrs)
+
+        # Phase 5: Episodic replay buffer (hippocampal analogue).
+        self.buffer = EpisodicBuffer(buffer_capacity)
 
         self.energy_history: list[float] = []
 
@@ -252,6 +339,8 @@ class CorticalGrid(nn.Module):
         global_input: Tensor,
         steps: int = 50,
         eta_x: float = 0.05,
+        online_learning: Optional[bool] = None,
+        eta_w: float = 0.001,
     ) -> list[float]:
         """Run the ODE settling loop across the entire grid.
 
@@ -260,10 +349,17 @@ class CorticalGrid(nn.Module):
           2. For each column, compute neighbor_context.
           3. Call column.infer_step(patch, neighbor_context).
 
+        After settling, behaviour depends on ``online_learning``:
+          * ``None``  — legacy mode: do nothing (caller manages learn()).
+          * ``True``  — online mode: call learn() immediately.
+          * ``False`` — replay mode: store frame in episodic buffer.
+
         Args:
-            global_input: (batch, grid_h*patch_h * grid_w*patch_w)
-            steps:        Number of Euler integration steps.
-            eta_x:        Step size for belief updates.
+            global_input:    (batch, grid_h*patch_h * grid_w*patch_w)
+            steps:           Number of Euler integration steps.
+            eta_x:           Step size for belief updates.
+            online_learning: None=legacy, True=learn now, False=store to buffer.
+            eta_w:           Learning rate (used only when online_learning=True).
 
         Returns:
             energy_history: Total grid energy per step.
@@ -299,6 +395,12 @@ class CorticalGrid(nn.Module):
 
             self.energy_history.append(self.get_total_energy())
 
+        # Phase 5: post-settling behaviour.
+        if online_learning is True:
+            self.learn(global_input, eta_w=eta_w)
+        elif online_learning is False:
+            self.buffer.store(global_input)
+
         return self.energy_history
 
     # ------------------------------------------------------------------
@@ -332,6 +434,44 @@ class CorticalGrid(nn.Module):
         for i in range(n_cols):
             ctx = self._gather_neighbor_context(i, B, device)
             self.columns[i].learn(eta_w=eta_w, neighbor_context=ctx)
+
+    # ------------------------------------------------------------------
+    # Consolidation (Hippocampal Replay)
+    # ------------------------------------------------------------------
+
+    def consolidate(
+        self,
+        batch_size: int = 32,
+        steps: int = 50,
+        eta_x: float = 0.05,
+        eta_w: float = 0.001,
+    ) -> list[float]:
+        """Hippocampal replay: sample shuffled memories, settle, learn.
+
+        Draws a random batch of historical sensory frames from the
+        episodic buffer, runs the full ODE settling loop, then performs
+        a single Hebbian weight update.  Because the batch is shuffled
+        across the entire memory trace, weight updates are distributed
+        over all past experiences — preventing catastrophic interference.
+
+        Args:
+            batch_size: Number of frames to sample from the buffer.
+            steps:      Euler integration steps for settling.
+            eta_x:      Belief update step size.
+            eta_w:      Weight learning rate.
+
+        Returns:
+            energy_history from the settling phase (empty if buffer empty).
+        """
+        if len(self.buffer) == 0:
+            return []
+        batch = self.buffer.sample(batch_size)
+        device = next(self.parameters()).device
+        batch = batch.to(device)
+        # Settle on the replayed batch (legacy mode — no double-store).
+        history = self.infer(batch, steps=steps, eta_x=eta_x)
+        self.learn(batch, eta_w=eta_w)
+        return history
 
     # ------------------------------------------------------------------
     # Temporal stepping
@@ -385,6 +525,7 @@ class CorticalStack(nn.Module):
         l2_obj_dim:  Dimensionality of Level 2 "What" state.
         l2_loc_dim:  Dimensionality of Level 2 "Where" state.
         activation_fn_name: Activation function for all columns.
+        buffer_capacity: Max frames in the episodic replay buffer.
     """
 
     def __init__(
@@ -398,6 +539,7 @@ class CorticalStack(nn.Module):
         l2_obj_dim: int = 32,
         l2_loc_dim: int = 4,
         activation_fn_name: str = "tanh",
+        buffer_capacity: int = 10_000,
     ) -> None:
         super().__init__()
 
@@ -426,6 +568,9 @@ class CorticalStack(nn.Module):
             sensory_dim=self.l2_sensory_dim,
             activation_fn_name=activation_fn_name,
         )
+
+        # Phase 5: Episodic replay buffer (hippocampal analogue).
+        self.buffer = EpisodicBuffer(buffer_capacity)
 
         self.energy_history: list[float] = []
 
@@ -463,6 +608,8 @@ class CorticalStack(nn.Module):
         steps: int = 50,
         eta_x: float = 0.05,
         freeze_l2: bool = False,
+        online_learning: Optional[bool] = None,
+        eta_w: float = 0.001,
     ) -> list[float]:
         """Run synchronous hierarchical inference across both levels.
 
@@ -476,12 +623,18 @@ class CorticalStack(nn.Module):
             5. All L1 columns infer_step(patch, eta_x,
                    neighbor_context, top_down_prior).
 
+        After settling, behaviour depends on ``online_learning``:
+          * ``None``  — legacy mode: do nothing (caller manages learn()).
+          * ``True``  — online mode: call learn() immediately.
+          * ``False`` — replay mode: store frame in episodic buffer.
+
         Args:
-            global_input: (batch, grid_h*patch_h * grid_w*patch_w)
-            steps: Number of Euler integration steps.
-            eta_x: Step size for belief updates.
-            freeze_l2: If True, Level 2 x_obj is frozen (for directed
-                saccade — L2 "holds" the expected concept).
+            global_input:    (batch, grid_h*patch_h * grid_w*patch_w)
+            steps:           Number of Euler integration steps.
+            eta_x:           Step size for belief updates.
+            freeze_l2:       If True, Level 2 x_obj is frozen.
+            online_learning: None=legacy, True=learn now, False=store to buffer.
+            eta_w:           Learning rate (used only when online_learning=True).
 
         Returns:
             energy_history: Total stack energy per step.
@@ -538,6 +691,12 @@ class CorticalStack(nn.Module):
 
             self.energy_history.append(self.get_total_energy())
 
+        # Phase 5: post-settling behaviour.
+        if online_learning is True:
+            self.learn(global_input, eta_w=eta_w)
+        elif online_learning is False:
+            self.buffer.store(global_input)
+
         return self.energy_history
 
     # ------------------------------------------------------------------
@@ -570,6 +729,41 @@ class CorticalStack(nn.Module):
         # Level 2: learn from settled L1 states.
         # No neighbor_context for Level 2 (single column, no lateral).
         self.level2.learn(eta_w=eta_w)
+
+    # ------------------------------------------------------------------
+    # Consolidation (Hippocampal Replay)
+    # ------------------------------------------------------------------
+
+    def consolidate(
+        self,
+        batch_size: int = 32,
+        steps: int = 50,
+        eta_x: float = 0.05,
+        eta_w: float = 0.001,
+    ) -> list[float]:
+        """Hippocampal replay: sample shuffled memories, settle, learn.
+
+        Same semantics as CorticalGrid.consolidate() but applied to the
+        full two-level hierarchy.
+
+        Args:
+            batch_size: Number of frames to sample from the buffer.
+            steps:      Euler integration steps for settling.
+            eta_x:      Belief update step size.
+            eta_w:      Weight learning rate.
+
+        Returns:
+            energy_history from the settling phase (empty if buffer empty).
+        """
+        if len(self.buffer) == 0:
+            return []
+        batch = self.buffer.sample(batch_size)
+        device = next(self.parameters()).device
+        batch = batch.to(device)
+        # Settle on the replayed batch (legacy mode — no double-store).
+        history = self.infer(batch, steps=steps, eta_x=eta_x)
+        self.learn(batch, eta_w=eta_w)
+        return history
 
     # ------------------------------------------------------------------
     # Motor aggregation
@@ -763,3 +957,70 @@ if __name__ == "__main__":
     print("  All parameters requires_grad=False  [OK]")
 
     print("\nCorticalStack smoke test passed.")
+
+    # -------------------------------------------------------------------
+    # EpisodicBuffer + Consolidation smoke test (Phase 5)
+    # -------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("EpisodicBuffer + Consolidation smoke test")
+    print(f"{'='*60}\n")
+
+    # --- Standalone buffer tests ---
+    buf = EpisodicBuffer(capacity=100)
+    D = 81
+    for _ in range(50):
+        buf.store(torch.randn(D))
+    assert len(buf) == 50, f"Expected 50, got {len(buf)}"
+    print(f"  Buffer store 50 frames: len={len(buf)}  [OK]")
+
+    sample = buf.sample(10)
+    assert sample.shape == (10, D), f"Expected (10,{D}), got {sample.shape}"
+    print(f"  Sample 10 frames: shape={sample.shape}  [OK]")
+
+    # FIFO eviction: store 60 more → 110 total attempts, capacity 100.
+    for _ in range(60):
+        buf.store(torch.randn(D))
+    assert len(buf) == 100, f"Expected 100, got {len(buf)}"
+    print(f"  FIFO eviction at capacity: len={len(buf)}  [OK]")
+
+    # Batched store: (B, D) decomposed into B rows.
+    buf.clear()
+    buf.store(torch.randn(5, D))
+    assert len(buf) == 5, f"Expected 5 from batched store, got {len(buf)}"
+    print(f"  Batched store (5, D): len={len(buf)}  [OK]")
+
+    # --- Grid buffer integration ---
+    grid_buf = CorticalGrid(
+        grid_h=3, grid_w=3,
+        obj_dim=36, loc_dim=4,
+        patch_h=3, patch_w=3,
+    ).to(device)
+
+    buf_input = torch.randn(1, 81, device=device)
+    for _ in range(20):
+        grid_buf.infer(buf_input, steps=5, eta_x=0.1, online_learning=False)
+    assert len(grid_buf.buffer) == 20, (
+        f"Expected 20 frames in buffer, got {len(grid_buf.buffer)}"
+    )
+    print(f"  Grid buffer after 20 infer(online_learning=False): "
+          f"len={len(grid_buf.buffer)}  [OK]")
+
+    # Consolidation.
+    consol_history = grid_buf.consolidate(
+        batch_size=8, steps=10, eta_x=0.1, eta_w=0.01,
+    )
+    assert len(consol_history) > 0, "Consolidation returned empty history"
+    print(f"  Consolidation returned {len(consol_history)} energy values  [OK]")
+
+    # Legacy mode: online_learning=None should NOT affect buffer.
+    buf_before = len(grid_buf.buffer)
+    grid_buf.infer(buf_input, steps=5, eta_x=0.1)  # online_learning=None
+    assert len(grid_buf.buffer) == buf_before, "Legacy mode should not store!"
+    print(f"  Legacy mode (online_learning=None) does not store  [OK]")
+
+    # No autograd.
+    for name, param in grid_buf.named_parameters():
+        assert not param.requires_grad, f"{name} has requires_grad=True!"
+    print("  All parameters requires_grad=False  [OK]")
+
+    print("\nEpisodicBuffer + Consolidation smoke test passed.")
