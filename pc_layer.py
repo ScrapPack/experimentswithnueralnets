@@ -25,8 +25,8 @@ Mathematical foundation (Free Energy Principle):
           prediction = tanh(pred_obj * pred_loc)   # element-wise multiply
     - L4 sensory error (Convention B):
           ε = prediction - sensory_input
-    - Scaled error (chain rule through tanh):
-          err_scaled = ε * (1 - prediction^2)
+    - Scaled error (chain rule through activation):
+          err_scaled = ε * activation_deriv(composite)
     - Lateral consensus error (Phase 2):
           err_lat = x_obj - W_lat @ neighbor_context
     - Top-down attention error (Phase 3):
@@ -38,18 +38,18 @@ Mathematical foundation (Free Energy Principle):
                    - π_l * err_lat - π_td * err_td - π_t * err_time
                    - α * x_obj
           dx_loc = - π_s * W_loc.T @ (err_scaled * pred_obj) - α * x_loc
-    - L5 motor action (Active Inference):
-          action = +eta_a * (sensory_gradient.T @ ε)
+    - L5 motor action (Active Inference, precision-scaled):
+          action = +eta_a * π_s * (sensory_gradient.T @ ε)
     - Variational Free Energy (precision-weighted):
           F = ½ π_s ||ε||² + ½ π_l ||err_lat||²
             + ½ π_td ||err_td||² + ½ π_t ||err_time||²
             + ½ α (||x_obj||² + ||x_loc||²)
-    - Weight learning (gradient descent):
-          W_obj -= η * (err_scaled * pred_loc).T @ x_obj
-          W_loc -= η * (err_scaled * pred_obj).T @ x_loc
-          W_lat += η * err_lat.T @ neighbor_context      (prior: additive)
-          W_trans += η * err_time_scaled.T @ x_obj_prev   (prior: additive)
-            where err_time_scaled = err_time * (1 - temporal_pred^2)
+    - Weight learning (precision-scaled gradient descent):
+          W_obj -= η * (π_s * err_scaled * pred_loc).T @ x_obj
+          W_loc -= η * (π_s * err_scaled * pred_obj).T @ x_loc
+          W_lat += η * (π_l * err_lat).T @ neighbor_context     (prior: additive)
+          W_trans += η * (π_t * err_time_scaled).T @ x_obj_prev  (prior: additive)
+            where err_time_scaled = err_time * activation_deriv(temporal_z)
 
 No autograd. No backpropagation. All dynamics are local ODEs
 minimising Free Energy (prediction error).
@@ -168,7 +168,7 @@ class CorticalColumn(nn.Module):
     and gradient descent uses strict subtraction on all terms:
         dx_obj = -W_obj.T @ (err_scaled * pred_loc) - err_lat - err_td - err_time
         dx_loc = -W_loc.T @ (err_scaled * pred_obj)
-      where err_scaled = error * (1 - prediction^2)  [error = prediction - input]
+      where err_scaled = error * activation_deriv(composite)  [error = prediction - input]
 
     Non-linear temporal (Phase 4.5):
         temporal_pred = tanh(W_trans @ x_obj_prev)
@@ -271,11 +271,13 @@ class CorticalColumn(nn.Module):
         # a -alpha * x term to the ODE that prevents runaway activations.
         self.alpha = 0.05
 
-        # --- Phase 4.5: cached intermediates for gated gradients ---
-        self._pred_obj = None      # x_obj @ W_obj.T  (cached for learn)
-        self._pred_loc = None      # x_loc @ W_loc.T  (cached for learn)
-        self._prediction = None    # tanh(pred_obj * pred_loc) (cached for learn)
-        self._temporal_pred = None # tanh(x_obj_prev @ W_trans.T) (cached for learn)
+        # --- Cached intermediates for gated gradients ---
+        self._pred_obj = None       # x_obj @ W_obj.T  (cached for learn)
+        self._pred_loc = None       # x_loc @ W_loc.T  (cached for learn)
+        self._prediction = None     # activation(pred_obj * pred_loc) (cached for learn)
+        self._composite = None      # pred_obj * pred_loc (pre-activation, for deriv)
+        self._temporal_pred = None  # activation(x_obj_prev @ W_trans.T) (cached for learn)
+        self._temporal_z = None     # x_obj_prev @ W_trans.T (pre-activation, for deriv)
 
     # ------------------------------------------------------------------
     # State management
@@ -315,7 +317,9 @@ class CorticalColumn(nn.Module):
         self._pred_obj = None
         self._pred_loc = None
         self._prediction = None
+        self._composite = None
         self._temporal_pred = None
+        self._temporal_z = None
 
     # ------------------------------------------------------------------
     # L2/3 → L4: Generative prediction
@@ -422,6 +426,7 @@ class CorticalColumn(nn.Module):
         self._pred_obj = pred_obj
         self._pred_loc = pred_loc
         self._prediction = prediction
+        self._composite = composite
 
         # Chain rule through activation derivative.
         deriv = self.activation_deriv(composite)    # (B, sensory_dim)
@@ -452,9 +457,9 @@ class CorticalColumn(nn.Module):
 
             # Temporal prediction pressure (Phase 4, non-linear).
             if self.x_obj_prev is not None:
-                temporal_pred = torch.tanh(
-                    self.x_obj_prev @ self.W_trans.t()
-                )  # (B, obj_dim)
+                temporal_z = self.x_obj_prev @ self.W_trans.t()  # (B, obj_dim)
+                temporal_pred = torch.tanh(temporal_z)
+                self._temporal_z = temporal_z
                 self._temporal_pred = temporal_pred
                 self.err_time = self.x_obj - temporal_pred
                 dx_obj = dx_obj - self.pi_time * self.err_time
@@ -495,7 +500,7 @@ class CorticalColumn(nn.Module):
               = -\\epsilon \\cdot \\frac{\\partial s}{\\partial a}
 
             a = -\\frac{\\partial F}{\\partial a}
-              = \\eta_a \\cdot \\epsilon \\cdot \\frac{\\partial s}{\\partial a}
+              = \\eta_a \\cdot \\pi_s \\cdot \\epsilon \\cdot \\frac{\\partial s}{\\partial a}
 
         Args:
             sensory_gradient: (batch, sensory_dim, action_dim) — spatial
@@ -515,12 +520,12 @@ class CorticalColumn(nn.Module):
         # Convention B (ε = p - s):
         #   dF/ds = -ε  (F = ½||p-s||², dF/ds = -(p-s) = -ε)
         #   dF/da = dF/ds · ds/da = -ε · ds/da
-        #   action = -dF/da = +ε · ds/da  (gradient descent on F)
+        #   action = -dF/da = +π_s · ε · ds/da  (precision-weighted gradient descent on F)
         #
         # error: (B, sensory_dim)
         # sensory_gradient: (B, sensory_dim, action_dim)
         # result: (B, action_dim)
-        action = eta_a * torch.einsum("bs,bsa->ba", self.error, sensory_gradient)
+        action = eta_a * self.pi_sensory * torch.einsum("bs,bsa->ba", self.error, sensory_gradient)
         return action
 
     # ------------------------------------------------------------------
@@ -544,11 +549,11 @@ class CorticalColumn(nn.Module):
         W -= η · ∇F = W += η · dW  (addition, unchanged).
 
         .. math::
-            \\text{err\\_scaled} = \\epsilon \\cdot (1 - \\text{prediction}^2)
-            W_{obj} -= \\eta_w \\cdot (\\text{err\\_scaled} \\ast p_{loc})^T \\cdot x_{obj}
-            W_{loc} -= \\eta_w \\cdot (\\text{err\\_scaled} \\ast p_{obj})^T \\cdot x_{loc}
-            W_{lat} += \\eta_w \\cdot \\text{err\\_lat}^T \\cdot \\bar{x}_{obj}^{\\text{nbr}}
-            W_{trans} += \\eta_w \\cdot \\text{err\\_time\\_scaled}^T \\cdot x_{obj\\_prev}
+            \\text{err\\_scaled} = \\epsilon \\cdot \\text{activation\\_deriv}(\\text{composite})
+            W_{obj} -= \\eta_w \\cdot (\\pi_s \\cdot \\text{err\\_scaled} \\ast p_{loc})^T \\cdot x_{obj}
+            W_{loc} -= \\eta_w \\cdot (\\pi_s \\cdot \\text{err\\_scaled} \\ast p_{obj})^T \\cdot x_{loc}
+            W_{lat} += \\eta_w \\cdot (\\pi_l \\cdot \\text{err\\_lat})^T \\cdot \\bar{x}_{obj}^{\\text{nbr}}
+            W_{trans} += \\eta_w \\cdot (\\pi_t \\cdot \\text{err\\_time\\_scaled})^T \\cdot x_{obj\\_prev}
 
         Averaged over the batch.
 
@@ -568,14 +573,15 @@ class CorticalColumn(nn.Module):
 
         batch_size = self.error.shape[0]
 
-        # Gated error: error scaled by activation derivative (tanh shortcut).
-        err_scaled = self.error * (1.0 - self._prediction.pow(2))
+        # Gated error: error scaled by activation derivative (generic registry).
+        err_scaled = self.error * self.activation_deriv(self._composite)
 
         # dW_obj: ∇_W F for generative object weights, gated by pred_loc.
+        # Precision-scaled: π_s weights the sensory error contribution.
         # (sensory_dim, B) @ (B, obj_dim) -> (sensory_dim, obj_dim)
-        dW_obj = ((err_scaled * self._pred_loc).t() @ self.x_obj) / batch_size
+        dW_obj = ((self.pi_sensory * err_scaled * self._pred_loc).t() @ self.x_obj) / batch_size
         # dW_loc: ∇_W F for generative location weights, gated by pred_obj.
-        dW_loc = ((err_scaled * self._pred_obj).t() @ self.x_loc) / batch_size
+        dW_loc = ((self.pi_sensory * err_scaled * self._pred_obj).t() @ self.x_loc) / batch_size
 
         # Gradient descent: W -= η · ∇F  (Convention B).
         self.W_obj.data -= eta_w * dW_obj
@@ -585,7 +591,7 @@ class CorticalColumn(nn.Module):
         # F_lat = ½||x - Wx_nbr||², ∇_W F = -err_lat · x_nbr^T.
         # Gradient descent: W -= η · (-err_lat · x_nbr^T) = W += η · dW.
         if neighbor_context is not None and self.err_lat is not None:
-            dW_lat = (self.err_lat.t() @ neighbor_context) / batch_size
+            dW_lat = ((self.pi_lat * self.err_lat).t() @ neighbor_context) / batch_size
             self.W_lat.data += eta_w * dW_lat
 
         # Temporal weight update (Phase 4.5, non-linear).
@@ -593,11 +599,10 @@ class CorticalColumn(nn.Module):
         if (self.x_obj_prev is not None
                 and self.err_time is not None
                 and self._temporal_pred is not None):
-            # Chain rule through tanh: scale err_time by tanh derivative.
-            err_time_scaled = self.err_time * (
-                1.0 - self._temporal_pred.pow(2)
-            )
-            dW_trans = (err_time_scaled.t() @ self.x_obj_prev) / batch_size
+            # Chain rule through activation: scale err_time by activation derivative
+            # applied to the pre-activation temporal value (generic registry).
+            err_time_scaled = self.err_time * self.activation_deriv(self._temporal_z)
+            dW_trans = ((self.pi_time * err_time_scaled).t() @ self.x_obj_prev) / batch_size
             self.W_trans.data += eta_w * dW_trans
 
     # ------------------------------------------------------------------
