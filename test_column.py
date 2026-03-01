@@ -29,6 +29,9 @@ from pc_layer import CorticalColumn, _get_device
 
 
 def main() -> None:
+    # Fixed seed for reproducible weight initialisation.
+    torch.manual_seed(42)
+
     device = _get_device()
     print(f"Device: {device}\n")
 
@@ -160,14 +163,15 @@ def main() -> None:
     # 5. Active Inference loop: emergent tracking
     # -----------------------------------------------------------------
     print("Phase 2: Active Inference — emergent sensorimotor tracking")
-    print(f"  Starting fovea at (2.0, 2.0)")
+    print(f"  Starting fovea at (3.0, 3.0)")
     print(f"  Target is at ({TARGET_Y}, {TARGET_X})")
     print(f"  {'step':>4s}  {'fy':>6s}  {'fx':>6s}  {'energy':>8s}  "
           f"{'dy':>7s}  {'dx':>7s}  {'x_obj_norm':>10s}  {'x_loc_norm':>10s}")
     print("  " + "-" * 72)
 
-    # Start the fovea away from the target.
-    fy, fx = 2.0, 2.0
+    # Start the fovea away from the target but within the Gaussian
+    # gradient field (sigma=1.5 → reliable gradient out to ~2 sigma).
+    fy, fx = 3.0, 3.0
 
     INFER_STEPS = 30
     ETA_X = 0.1
