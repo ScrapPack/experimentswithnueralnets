@@ -6,9 +6,10 @@ physically simulate a destructible 2D grid.  The network resolves
 physical strikes by minimizing free energy.
 
 World representation:
-    A 10×10 dual-channel tensor of shape (1, 200).
-    Indices 0–99:   Density (+1.0 = solid, −1.0 = air)
-    Indices 100–199: Thermal (−1.0 = cold, +1.0 = hot)
+    A 10×10 tri-channel tensor of shape (1, 300).
+    Indices 0–99:   Density  (+1.0 = solid, −1.0 = air)
+    Indices 100–199: Thermal  (−1.0 = cold, +1.0 = hot)
+    Indices 200–299: Gas/Smoke (+1.0 = dense smoke, −1.0 = clear air)
 
 Materials (Phase 10):
     The grid is split into three vertical material columns:
@@ -26,6 +27,11 @@ Cross-channel coupling (Phase 10):
       Ice  → 0.5 cold stress  (endothermic melting absorbs heat).
       Stone → no thermal reaction.
     Air dissipates heat: destroyed cells lose 0.5 thermal each resolution.
+
+Gas/Smoke channel (Phase 13):
+    Wood combustion emits gas_stress = 1.0 alongside heat_stress.
+    Gas propagates upward via _BUOYANCY_KERNEL (inverted gravity).
+    Gas dissipates at 0.1 per tick (faster than thermal).
 
 Continuous background inference (Phase 11):
     POST /tick advances the world by one time step:
@@ -82,9 +88,9 @@ from pc_network import PCNetwork
 GRID_W: int = 10
 GRID_H: int = 10
 GRID_CELLS: int = GRID_W * GRID_H          # 100 (per channel)
-SENSORY_DIM: int = GRID_CELLS * 2            # 200 (density + thermal)
+SENSORY_DIM: int = GRID_CELLS * 3            # 300 (density + thermal + gas)
 
-LAYER_DIMS: list[int] = [32, SENSORY_DIM]    # [32, 200]
+LAYER_DIMS: list[int] = [32, SENSORY_DIM]    # [32, 300]
 ACTIVATION: str = "tanh"
 
 # Pre-training
@@ -107,6 +113,7 @@ MAX_SETTLE_ROUNDS: int = 10        # max cascade iterations per strike
 # Tick — continuous background inference (Phase 11)
 TICK_THERMAL_DECAY: float = 0.05   # thermal dissipation per tick
 TICK_DENSITY_DECAY: float = 0.02   # ambient entropy per tick
+TICK_GAS_DECAY: float = 0.1        # gas/smoke dissipation per tick
 TICK_INFER_STEPS: int = 5          # inference steps for healing
 TICK_ETA_X: float = 0.1            # inference learning rate
 
@@ -122,12 +129,13 @@ print(f"Device: {device}")
 
 net = PCNetwork(layer_dims=LAYER_DIMS, activation_fn_name=ACTIVATION).to(device)
 print(net)
-print(f"Grid : {GRID_W}×{GRID_H} = {GRID_CELLS} cells × 2 channels = {SENSORY_DIM} dims")
+print(f"Grid : {GRID_W}×{GRID_H} = {GRID_CELLS} cells × 3 channels = {SENSORY_DIM} dims")
 
-# World state: density = solid (+1.0), thermal = cold (−1.0).
+# World state: density = solid (+1.0), thermal = cold (−1.0), gas = clear (−1.0).
 current_world_state = torch.cat([
     torch.ones(1, GRID_CELLS, device=device),         # density: solid
     torch.full((1, GRID_CELLS), -1.0, device=device), # thermal: cold
+    torch.full((1, GRID_CELLS), -1.0, device=device), # gas: clear
 ], dim=1)
 
 # Permanent damage tracking — struck cells never heal.
@@ -156,6 +164,17 @@ _RADIANCE_KERNEL = torch.tensor(
     [[0.15, 0.15, 0.15],
      [0.15, 0.00, 0.15],
      [0.15, 0.15, 0.15]],
+    device=device,
+).view(1, 1, 3, 3)
+
+# Buoyancy kernel — smoke/gas rises upward (Phase 13).
+# Inverted gravity: the cell ABOVE receives the most gas from the cell BELOW.
+# In F.conv2d (cross-correlation), kernel[2,1] weights the input from the
+# cell BELOW (y+1) into the current cell — so k[2,1] = 0.30 makes gas rise.
+_BUOYANCY_KERNEL = torch.tensor(
+    [[0.02, 0.05, 0.02],
+     [0.15, 0.00, 0.15],
+     [0.05, 0.30, 0.05]],
     device=device,
 ).view(1, 1, 3, 3)
 
@@ -228,6 +247,8 @@ def pre_train_physics() -> None:
             density = torch.ones(1, GRID_CELLS, device=device)
             # Thermal channel: cold baseline.
             thermal = torch.full((1, GRID_CELLS), -1.0, device=device)
+            # Gas channel: clear baseline.
+            gas = torch.full((1, GRID_CELLS), -1.0, device=device)
 
             if step < 150:
                 # Phase 1 — solid with slight noise (density only).
@@ -238,7 +259,7 @@ def pre_train_physics() -> None:
                 hole_idxs = torch.randint(0, GRID_CELLS, (n_holes,))
                 density[0, hole_idxs] = -1.0
 
-            target = torch.cat([density, thermal], dim=1)  # (1, 200)
+            target = torch.cat([density, thermal, gas], dim=1)  # (1, 300)
 
             net.infer(target, steps=PRETRAIN_INFER_STEPS, eta_x=PRETRAIN_ETA_X)
             net.learn(eta_w=PRETRAIN_ETA_W, eta_v=PRETRAIN_ETA_V)
@@ -282,12 +303,12 @@ def _propagate_stress(
         Ice   downward: 0.30 × 0.40 = 0.120
 
     Args:
-        state:  (1, 200) full world state (density + thermal).
+        state:  (1, 300) full world state (density + thermal + gas).
         stress: (1, 100) stress seeded at the struck cell only
                 (density-grid indices).
 
     Returns:
-        (1, 200) world state with density slice weakened.
+        (1, 300) world state with density slice weakened.
     """
     result = state.clone()
 
@@ -324,11 +345,11 @@ def _propagate_heat(
       - ADDS heat energy (moves toward +1.0) instead of weakening.
 
     Args:
-        state:  (1, 200) full world state.
+        state:  (1, 300) full world state.
         stress: (1, 100) thermal stress seeded at the heated cell.
 
     Returns:
-        (1, 200) world state with thermal slice heated.
+        (1, 300) world state with thermal slice heated.
     """
     result = state.clone()
 
@@ -339,8 +360,8 @@ def _propagate_heat(
 
     # Add heat to the thermal slice (100–199).
     heating = spread.view(1, GRID_CELLS) * STRESS_SCALE
-    result[:, GRID_CELLS:] = (
-        result[:, GRID_CELLS:] + heating
+    result[:, GRID_CELLS:2*GRID_CELLS] = (
+        result[:, GRID_CELLS:2*GRID_CELLS] + heating
     ).clamp(-1.0, 1.0)
 
     return result
@@ -357,12 +378,12 @@ def _propagate_cold(
     ice-melt cooling that absorbs heat from neighbouring cells.
 
     Args:
-        state:  (1, 200) full world state.
+        state:  (1, 300) full world state.
         stress: (1, 100) cooling magnitude (positive values = amount
                 of cooling to apply).
 
     Returns:
-        (1, 200) world state with thermal slice cooled.
+        (1, 300) world state with thermal slice cooled.
     """
     result = state.clone()
 
@@ -373,8 +394,43 @@ def _propagate_cold(
 
     # Subtract heat from the thermal slice (100–199).
     cooling = spread.view(1, GRID_CELLS) * STRESS_SCALE
-    result[:, GRID_CELLS:] = (
-        result[:, GRID_CELLS:] - cooling
+    result[:, GRID_CELLS:2*GRID_CELLS] = (
+        result[:, GRID_CELLS:2*GRID_CELLS] - cooling
+    ).clamp(-1.0, 1.0)
+
+    return result
+
+
+def _propagate_gas(
+    state: torch.Tensor,
+    stress: torch.Tensor,
+) -> torch.Tensor:
+    """Propagate gas/smoke upward with the buoyancy kernel (Phase 13).
+
+    Same max-propagation as _propagate_heat, but:
+      - Uses _BUOYANCY_KERNEL (upward-biased — smoke rises).
+      - No tensile dampening — gas flows freely.
+      - Operates on the gas slice (indices 200–299).
+      - ADDS gas (moves toward +1.0).
+
+    Args:
+        state:  (1, 300) full world state.
+        stress: (1, 100) gas stress (positive = amount of smoke emitted).
+
+    Returns:
+        (1, 300) world state with gas slice increased.
+    """
+    result = state.clone()
+
+    spread = stress.view(1, 1, GRID_H, GRID_W)
+    for _ in range(PROPAGATION_PASSES):
+        padded = F.pad(spread, [1, 1, 1, 1], mode="constant", value=0.0)
+        spread = torch.max(spread, F.conv2d(padded, _BUOYANCY_KERNEL))
+
+    # Add smoke to the gas slice (200–299).
+    smoking = spread.view(1, GRID_CELLS) * STRESS_SCALE
+    result[:, 2*GRID_CELLS:] = (
+        result[:, 2*GRID_CELLS:] + smoking
     ).clamp(-1.0, 1.0)
 
     return result
@@ -389,16 +445,17 @@ def _resolve_physics_cascades() -> None:
 
     Called after the initial perturbation (strike or heat) to resolve
     all secondary effects: cascading collapses, phase-change reactions,
-    dual-channel propagation, and thermal dissipation in air.
+    multi-channel propagation, and thermal dissipation in air.
 
     Collapse conditions (per cell, each round):
       - Structural: density < threshold_map
       - Thermal:    thermal > thermal_tolerance_map
 
-    Phase-change thermal reactions on collapse:
-      - Wood (exothermic):  injects +1.0 heat stress (combustion)
+    Phase-change reactions on collapse:
+      - Wood (exothermic):  injects +1.0 heat stress + 1.0 gas stress
+                            (combustion produces heat AND smoke)
       - Ice  (endothermic): injects  0.5 cold stress (melting absorbs heat)
-      - Stone:              no thermal reaction
+      - Stone:              no thermal/gas reaction
 
     After all cascade rounds, air dissipates heat: every destroyed cell's
     thermal value is reduced by 0.5 (clamped to −1.0).
@@ -430,10 +487,11 @@ def _resolve_physics_cascades() -> None:
             destroyed_cells.add(i)
         _force_destroyed(current_world_state)
 
-        # Build per-cell stress tensors for dual propagation.
+        # Build per-cell stress tensors for multi-channel propagation.
         struct_stress = torch.zeros(1, GRID_CELLS, device=device)
         heat_stress   = torch.zeros(1, GRID_CELLS, device=device)
         cold_stress   = torch.zeros(1, GRID_CELLS, device=device)
+        gas_stress    = torch.zeros(1, GRID_CELLS, device=device)
 
         for i, old_d, old_t in newly_collapsed:
             y_i = i // GRID_W
@@ -445,13 +503,14 @@ def _resolve_physics_cascades() -> None:
                 abs(old_d + 1.0) * precision_map[y_i, x_i].item()
             )
 
-            # Phase-change thermal reaction.
+            # Phase-change reactions.
             if mat == "wood":
                 heat_stress[0, i] = 1.0    # exothermic combustion
+                gas_stress[0, i]  = 1.0    # combustion emits smoke
             elif mat == "ice":
                 cold_stress[0, i] = 0.5    # endothermic melting
 
-        # Dual propagation — structural, heating, and cooling.
+        # Multi-channel propagation — structural, heating, cooling, gas.
         if struct_stress.max().item() > 0:
             current_world_state = _propagate_stress(
                 current_world_state, struct_stress,
@@ -463,6 +522,10 @@ def _resolve_physics_cascades() -> None:
         if cold_stress.max().item() > 0:
             current_world_state = _propagate_cold(
                 current_world_state, cold_stress,
+            )
+        if gas_stress.max().item() > 0:
+            current_world_state = _propagate_gas(
+                current_world_state, gas_stress,
             )
 
         _force_destroyed(current_world_state)
@@ -510,11 +573,12 @@ def get_state():
 
     Returns JSON::
 
-        {"state": [200 floats], "materials": [100 strings]}
+        {"state": [300 floats], "materials": [100 strings]}
 
-    ``state`` contains 200 values: indices 0–99 are density,
-    indices 100–199 are thermal.  ``materials`` is a flat list of
-    ``"stone"``, ``"wood"``, or ``"ice"`` per cell (row-major, 100).
+    ``state`` contains 300 values: indices 0–99 are density,
+    indices 100–199 are thermal, indices 200–299 are gas/smoke.
+    ``materials`` is a flat list of ``"stone"``, ``"wood"``, or
+    ``"ice"`` per cell (row-major, 100).
     """
     state_list = current_world_state.squeeze(0).cpu().tolist()
     return jsonify({"state": state_list, "materials": _material_labels})
@@ -527,10 +591,11 @@ def strike():
     1. Mark the cell as permanently destroyed.
     2. Run inference — the network reacts to the damage.
     3. Propagate structural stress with the gravity kernel.
-    4. Unified cascade: structural & thermal collapse, phase changes.
+    4. Unified cascade: structural & thermal collapse, phase changes,
+       gas emission from combustion.
 
     Expects JSON: ``{"x": <int>, "y": <int>}``
-    Returns: flat JSON list of 200 floats (the new world state).
+    Returns: flat JSON list of 300 floats (the new world state).
     """
     global current_world_state
 
@@ -581,11 +646,11 @@ def heat():
     1. Force the cell's thermal value to +1.0 (maximum heat).
     2. Run inference — the network reacts to the thermal anomaly.
     3. Propagate thermal stress with the radiance kernel.
-    4. Unified cascade: thermal collapse (wood ignites, ice melts),
-       structural fallout, phase-change reactions.
+    4. Unified cascade: thermal collapse (wood ignites with smoke,
+       ice melts), structural fallout, phase-change reactions.
 
     Expects JSON: ``{"x": <int>, "y": <int>}``
-    Returns: flat JSON list of 200 floats (the new world state).
+    Returns: flat JSON list of 300 floats (the new world state).
     """
     global current_world_state
 
@@ -631,28 +696,34 @@ def heat():
 def tick():
     """Advance the world by one background time step.
 
-    Continuous environmental processes (Phase 11):
+    Continuous environmental processes (Phase 11 + 13):
       1. Thermal dissipation — all cells cool toward −1.0.
       2. Ambient entropy — all cells weaken toward −1.0.
-      3. Continuous inference — the network's prediction gently heals
+      3. Gas dissipation — smoke clears toward −1.0 (fast: 0.1/tick).
+      4. Continuous inference — the network's prediction gently heals
          undamaged structure (steps=5, eta_x=0.1).
-      4. Force destroyed cells — permanent damage stays.
-      5. Resolve cascades — slow decay may trigger new collapses.
+      5. Force destroyed cells — permanent damage stays.
+      6. Resolve cascades — slow decay may trigger new collapses.
 
     Called by the Godot / browser client on a 0.5 s timer.
-    Returns: flat JSON list of 200 floats (the new world state).
+    Returns: flat JSON list of 300 floats (the new world state).
     """
     global current_world_state
 
     with torch.no_grad():
         # 1. Thermal dissipation: everything cools toward −1.0.
-        current_world_state[:, GRID_CELLS:] = (
-            current_world_state[:, GRID_CELLS:] - TICK_THERMAL_DECAY
+        current_world_state[:, GRID_CELLS:2*GRID_CELLS] = (
+            current_world_state[:, GRID_CELLS:2*GRID_CELLS] - TICK_THERMAL_DECAY
         ).clamp(-1.0, 1.0)
 
         # 2. Ambient entropy: density drifts toward −1.0 (weathering).
         current_world_state[:, :GRID_CELLS] = (
             current_world_state[:, :GRID_CELLS] - TICK_DENSITY_DECAY
+        ).clamp(-1.0, 1.0)
+
+        # 3. Gas dissipation: smoke clears toward −1.0.
+        current_world_state[:, 2*GRID_CELLS:] = (
+            current_world_state[:, 2*GRID_CELLS:] - TICK_GAS_DECAY
         ).clamp(-1.0, 1.0)
 
         # 3. Continuous inference: the network heals toward its prior.
@@ -674,12 +745,13 @@ def tick():
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    """Reset the world: density → solid, thermal → cold."""
+    """Reset the world: density → solid, thermal → cold, gas → clear."""
     global current_world_state
     destroyed_cells.clear()
     current_world_state = torch.cat([
-        torch.ones(1, GRID_CELLS, device=device),
-        torch.full((1, GRID_CELLS), -1.0, device=device),
+        torch.ones(1, GRID_CELLS, device=device),         # density: solid
+        torch.full((1, GRID_CELLS), -1.0, device=device), # thermal: cold
+        torch.full((1, GRID_CELLS), -1.0, device=device), # gas: clear
     ], dim=1)
     return jsonify(current_world_state.squeeze(0).cpu().tolist())
 
@@ -691,7 +763,7 @@ def reset():
 if __name__ == "__main__":
     pre_train_physics()
     print(f"Server ready → http://127.0.0.1:5001")
-    print(f"  GET  /get_state   — fetch 200-dim state (density + thermal)")
+    print(f"  GET  /get_state   — fetch 300-dim state (density + thermal + gas)")
     print(f"  POST /strike      — destroy a block   (JSON: {{x, y}})")
     print(f"  POST /heat        — heat a block      (JSON: {{x, y}})")
     print(f"  POST /tick        — background step   (entropy + healing)")

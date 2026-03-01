@@ -6,10 +6,11 @@
 ## Left-click = strike (destroy).  Right-click / Shift+click = heat.
 ## The Python server resolves physics via free-energy minimization.
 ##
-## Dual-state (Phase 9):
-##   State tensor is 200-dim: [density×100, thermal×100].
-##   Density: +1.0 = solid, −1.0 = air.
-##   Thermal: −1.0 = cold, +1.0 = hot.
+## Tri-channel state (Phase 13):
+##   State tensor is 300-dim: [density×100, thermal×100, gas×100].
+##   Density:   +1.0 = solid, −1.0 = air.
+##   Thermal:   −1.0 = cold,  +1.0 = hot.
+##   Gas/Smoke: −1.0 = clear, +1.0 = dense smoke.
 ##
 ## Materials (Phase 10):
 ##   Stone (x < 3):     Simplex noise, dark slate gray
@@ -26,7 +27,8 @@
 ##   All material textures generated synchronously in _ready() using
 ##   FastNoiseLite + Image + ImageTexture (no async await needed).
 ##   Heat overlay: radial GradientTexture2D with additive blending.
-##   Heat sprites pulse subtly via _process() for fire animation.
+##   Smoke overlay: radial GradientTexture2D, semi-transparent dark gray.
+##   Heat sprites pulse via _process(); smoke sprites lazily rotate.
 
 extends Node2D
 
@@ -43,7 +45,7 @@ const SERVER_URL: String = "http://127.0.0.1:5001"
 # State
 # ---------------------------------------------------------------------------
 
-var blocks: Array = []              # Array of { "base": Sprite2D, "heat": Sprite2D }
+var blocks: Array = []              # Array of { "base": Sprite2D, "heat": Sprite2D, "smoke": Sprite2D }
 var materials: Array = []           # "stone", "wood", or "ice" per cell
 var http_request: HTTPRequest
 var request_pending: bool = false   # guard against overlapping requests
@@ -53,11 +55,12 @@ var tick_http_request: HTTPRequest
 var tick_request_pending: bool = false
 var tick_timer: Timer
 
-# Procedural textures (Phase 12)
+# Procedural textures (Phase 12 + 13)
 var tex_stone: ImageTexture
 var tex_wood: ImageTexture
 var tex_ice: ImageTexture
 var tex_heat: GradientTexture2D
+var tex_smoke: GradientTexture2D
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +153,27 @@ func _generate_heat_texture() -> GradientTexture2D:
 	return tex
 
 
+func _generate_smoke_texture() -> GradientTexture2D:
+	# Radial gradient: semi-transparent dark gray center → transparent (50×50).
+	var grad := Gradient.new()
+	grad.colors = PackedColorArray([
+		Color(0.15, 0.15, 0.15, 0.9),   # dense dark gray center
+		Color(0.15, 0.15, 0.15, 0.4),   # mid fade
+		Color(0.15, 0.15, 0.15, 0.0),   # transparent edge
+	])
+	grad.offsets = PackedFloat32Array([0.0, 0.5, 1.0])
+
+	var tex := GradientTexture2D.new()
+	tex.width = 50
+	tex.height = 50
+	tex.fill = GradientTexture2D.FILL_RADIAL
+	tex.fill_from = Vector2(0.5, 0.5)   # center
+	tex.fill_to = Vector2(1.0, 0.5)     # radius = half width
+	tex.gradient = grad
+
+	return tex
+
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -166,6 +190,7 @@ func _ready() -> void:
 	tex_wood  = _generate_wood_texture()
 	tex_ice   = _generate_ice_texture()
 	tex_heat  = _generate_heat_texture()
+	tex_smoke = _generate_smoke_texture()
 
 	# --- Build the node grid ---
 	for y in range(GRID_H):
@@ -196,7 +221,19 @@ func _ready() -> void:
 			heat_sprite.modulate = Color(1, 1, 1, 0)    # invisible initially
 			container.add_child(heat_sprite)
 
-			blocks.append({ "base": base_sprite, "heat": heat_sprite })
+			# Smoke overlay sprite (50×50, centered on cell, Phase 13).
+			var smoke_sprite := Sprite2D.new()
+			smoke_sprite.texture = tex_smoke
+			smoke_sprite.centered = true
+			smoke_sprite.position = Vector2(BLOCK_SIZE / 2.0, BLOCK_SIZE / 2.0)
+			smoke_sprite.modulate = Color(1, 1, 1, 0)   # invisible initially
+			container.add_child(smoke_sprite)
+
+			blocks.append({
+				"base": base_sprite,
+				"heat": heat_sprite,
+				"smoke": smoke_sprite,
+			})
 
 	# --- Networking (player actions) ---
 	http_request = HTTPRequest.new()
@@ -221,18 +258,23 @@ func _ready() -> void:
 
 
 # ---------------------------------------------------------------------------
-# Animation — heat pulse (Phase 12)
+# Animation — heat pulse + smoke rotation (Phase 12 + 13)
 # ---------------------------------------------------------------------------
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	var time: float = Time.get_ticks_msec() / 1000.0
 	for i in range(blocks.size()):
+		# Heat pulse animation.
 		var heat: Sprite2D = blocks[i]["heat"]
 		if heat.modulate.a > 0.01:
-			# Subtle pulsing scale so the fire looks alive.
-			# Per-cell phase offset (i * 0.7) prevents uniform pulsing.
 			var pulse: float = 1.0 + 0.15 * sin(time * 6.0 + float(i) * 0.7)
 			heat.scale = Vector2(pulse, pulse)
+
+		# Smoke lazy rotation — alternating CW/CCW per cell.
+		var smoke: Sprite2D = blocks[i]["smoke"]
+		if smoke.modulate.a > 0.01:
+			var direction: float = 1.0 if i % 2 == 0 else -1.0
+			smoke.rotation += delta * 0.5 * direction
 
 
 # ---------------------------------------------------------------------------
@@ -350,12 +392,12 @@ func _on_tick_request_completed(
 	if err != OK:
 		return
 
-	# /tick returns a flat 200-element array.
+	# /tick returns a flat 300-element array.
 	if json.data is Array:
 		update_grid(json.data)
 
 # ---------------------------------------------------------------------------
-# Rendering (Phase 12 — procedural textures)
+# Rendering (Phase 12 + 13 — procedural textures + smoke)
 # ---------------------------------------------------------------------------
 
 func update_grid(state: Array) -> void:
@@ -371,6 +413,10 @@ func update_grid(state: Array) -> void:
 		var heat_val: float = -1.0
 		if i + grid_cells < state.size():
 			heat_val = clampf(float(state[i + grid_cells]), -1.0, 1.0)
+		# Gas/Smoke value: indices 200–299 (Phase 13).
+		var gas_val: float = -1.0
+		if i + grid_cells * 2 < state.size():
+			gas_val = clampf(float(state[i + grid_cells * 2]), -1.0, 1.0)
 
 		# Determine material for this cell.
 		var mat: String = "stone"
@@ -388,6 +434,7 @@ func update_grid(state: Array) -> void:
 
 		var base: Sprite2D = blocks[i]["base"]
 		var heat: Sprite2D = blocks[i]["heat"]
+		var smoke: Sprite2D = blocks[i]["smoke"]
 
 		# --- Material texture swap ---
 		if mat == "stone":
@@ -425,3 +472,14 @@ func update_grid(state: Array) -> void:
 			heat_t = clampf(heat_t, 0.0, 1.0)
 			heat.modulate = Color(1, 1, 1, heat_t)
 			# Scale pulse is handled by _process() for smooth 60fps animation.
+
+		# --- Gas/Smoke overlay (Phase 13) ---
+		if gas_val < -0.8:
+			# Clear — smoke overlay invisible.
+			smoke.modulate = Color(1, 1, 1, 0)
+		else:
+			# Map [-0.8 .. 1.0] → [0.0 .. 1.0] for smooth fade-in.
+			var gas_t: float = (gas_val + 0.8) / 1.8
+			gas_t = clampf(gas_t, 0.0, 1.0)
+			smoke.modulate = Color(1, 1, 1, gas_t)
+			# Lazy rotation is handled by _process().
